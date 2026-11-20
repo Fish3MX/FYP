@@ -68,6 +68,40 @@ Project/
 
 ---
 
+## Credentials
+
+The LLM compiler needs an API key, a base URL and a model name. There are two
+ways to provide them, and neither puts a secret in the repository.
+
+**Option A — a `.env` file (recommended)**
+
+```bash
+cp .env.example .env
+$EDITOR .env          # fill in LLM_API_KEY
+python scripts/check_llm.py
+```
+
+`.env` is git-ignored. Real environment variables always take precedence over
+its contents, so a file can hold defaults while a shell export overrides them
+for one run.
+
+**Option B — exported environment variables**
+
+```bash
+export LLM_API_KEY=sk-xxxx
+export LLM_BASE_URL=https://api.deepseek.com/v1
+export LLM_MODEL=deepseek-chat
+python scripts/check_llm.py
+```
+
+`src/llm_env.py` is the only module that reads these, and `scripts/check_llm.py`
+makes one five-token request to confirm the endpoint works before any
+compilation is attempted. It turns an opaque failure inside the compiler into a
+specific diagnosis: bad key, wrong base URL, unknown model, quota, or an
+unreachable network.
+
+Never commit a key. If one leaks, revoke it in the provider's console.
+
 ## Testing
 
 Half of this pipeline is pure data manipulation and must not require a simulator
@@ -91,6 +125,11 @@ It covers, with no engine, no GPU and no AirSim connection:
   4 m doorway is cut into it
 - requirement assertions that actually fail when they should (`max_time_s=1`)
 - every template scenario being geometrically usable, not merely schema-valid
+- the compile loop retrying after a geometric failure and feeding back a
+  concrete diagnostic, giving up explicitly when it never converges, and
+  accepting the same bad scenario when `--no-verify` is set (the ablation)
+- credential parsing: quoted values, `export` prefix, trailing comments, a
+  Windows BOM, environment-over-file precedence, and key masking
 
 Run it after every change to the spec schema, the catalogue, the compiler or the
 verifier, before spending time on the workstation.
@@ -270,8 +309,27 @@ instead of half-building a scene and reporting 15 separate spawn errors.
 | LLM compiler: request → spec, validate-and-retry loop | done |
 | Deterministic template baseline (no-API comparison) | done |
 | Geometric verifier: solvability, occlusion, non-triviality | done |
-| Episode runner + metrics (SR / OSR / SPL / NE) | planned |
+| Verifier wired into the retry loop, with ablation flag | done |
+| Credential handling via environment or git-ignored `.env` | done |
+| Episode runner + metrics (SR / OSR / SPL / NE) | next |
 | Difficulty-parameter sweep | planned |
+
+### The ablation that measures what verification buys
+
+`compile_request(..., verify_geometry=False)` runs the identical model and
+prompts with the geometric gate removed. Comparing the two conditions is the
+experiment behind RQ2:
+
+```bash
+# with verification (default)
+python src/llm_compiler.py --request "..." --out specs/with_verify.json
+
+# without it
+python src/llm_compiler.py --request "..." --out specs/no_verify.json --no-verify
+```
+
+Acceptance rate, retry counts and the failure taxonomy across a batch of
+requests, with and without the gate, are the numbers to report.
 
 ---
 

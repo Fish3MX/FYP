@@ -59,6 +59,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 from asset_catalog import prompt_text, whitelist
+from llm_env import load_env_file, resolve_config
 from scene_spec import SceneSpec, SpecError, parse_spec
 
 LOG = logging.getLogger("llm_compiler")
@@ -91,6 +92,23 @@ SCHEMA_BRIEF = """
   "instruction": "one or two sentences telling the drone what to do"
 }
 """
+
+
+# Actionable hints appended when geometric verification fails. The verifier
+# reports what is wrong; these tell the model what to change.
+GEOMETRY_HINTS = """\
+Hints for the geometric failures above:
+  - "no feasible path": the target is sealed in. Cut a doorway at least 4 m wide
+    into the surrounding wall, and leave an opening at least 3x3 m in any floor
+    slab between the spawn and the target (a stairwell).
+  - "cannot see": you need the opposite -- move the target behind a wall or
+    inside the structure so it is hidden from the spawn pose.
+  - "too easy": increase the distance between spawn and target, or add structure
+    that forces a longer route.
+  - "cannot be satisfied": relax or remove that requirement, or enlarge the
+    scenario until it becomes achievable.
+  - remember that a 0.6 m safety clearance is applied to every solid object, so
+    narrow gaps close up."""
 
 
 # --------------------------------------------------------------------------- #
@@ -487,11 +505,20 @@ def compile_request(
     model: str,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     temperature: float = 0.2,
+    verify_geometry: bool = True,
 ) -> SceneSpec:
-    """Generate, validate, feed back, repeat until a valid spec appears.
+    """Generate, validate, verify, feed back, repeat until a usable spec appears.
 
-    Returns a validated SceneSpec. Raises RuntimeError when the retry budget is
-    exhausted, with the full problem list from the last round.
+    Each round runs four gates in order: JSON parsing, structural validation,
+    semantic sanity, and geometric verification. Any failure is turned into a
+    concrete problem list and sent back to the model, which then rewrites.
+
+    `verify_geometry=False` skips the last gate. That is useful for measuring
+    the contribution of verification itself: the same model, the same prompts,
+    with and without the geometric check.
+
+    Returns a validated, geometrically usable SceneSpec. Raises RuntimeError
+    when the retry budget is exhausted, with the last round's problems.
     """
     messages: List[Dict[str, str]] = [
         {"role": "system", "content": system_prompt()},
@@ -561,6 +588,42 @@ def compile_request(
             all_problems = problems
             continue
 
+        # --- geometric verification ---
+        # This is the step that turns "the model produced a scene" into "the
+        # scene is a usable test". Without it, a sealed building or a target in
+        # plain sight would reach the disk and be discovered only at runtime.
+        if verify_geometry:
+            import verifier as _verifier
+
+            result = _verifier.verify(spec)
+            if not result.usable:
+                problems = list(result.failures) or [
+                    "the scenario is not usable as a test"
+                ]
+                LOG.warning(
+                    "geometric verification failed with %d problem(s); "
+                    "sending them back",
+                    len(problems),
+                )
+                messages += [
+                    {"role": "assistant", "content": json.dumps(data, ensure_ascii=False)},
+                    {"role": "user", "content":
+                        "The scenario is structurally valid but geometrically "
+                        "unusable. Fix ALL of these and return the complete "
+                        "corrected JSON:\n- "
+                        + "\n- ".join(problems)
+                        + "\n\n" + GEOMETRY_HINTS},
+                ]
+                all_problems = problems
+                continue
+
+            LOG.info(
+                "attempt %d passed geometry: path %.1f m, detour %.2f",
+                attempt,
+                result.path_length_m or 0.0,
+                result.detour_ratio or 0.0,
+            )
+
         LOG.info("attempt %d passed every check", attempt)
         return spec
 
@@ -575,6 +638,11 @@ def compile_request(
 # Entry point
 # --------------------------------------------------------------------------- #
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # Load .env before argparse evaluates its defaults, so that a key declared
+    # in the file is picked up exactly like an exported environment variable.
+    # A real environment variable still wins.
+    env_file = load_env_file()
+
     parser = argparse.ArgumentParser(
         description="Natural-language request -> scenario specification JSON",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -594,7 +662,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument(
         "--no-verify",
         action="store_true",
-        help="skip geometric verification (solvability, occlusion, non-triviality)",
+        help=(
+            "skip geometric verification inside the retry loop; useful for "
+            "measuring what verification contributes"
+        ),
     )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -603,6 +674,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
+    )
+
+    if env_file is not None:
+        LOG.debug("credentials file loaded: %s", env_file)
+    LOG.debug(
+        "endpoint: base_url=%s model=%s api_key=%s",
+        args.base_url,
+        args.model,
+        resolve_config(load_file=False).masked_key(),
     )
 
     # ---- offline template ----
@@ -642,6 +722,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             model=args.model,
             max_attempts=args.max_attempts,
             temperature=args.temperature,
+            verify_geometry=not args.no_verify,
         )
     except RuntimeError as exc:
         LOG.error("compilation failed: %s", exc)

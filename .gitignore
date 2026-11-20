@@ -229,8 +229,16 @@ assets_report.json
 *.log
 
 # Local environment / secrets
+.env
 .env.local
+.envrc
 settings.local.json
+
+# Generated specifications are reproducible from a request plus the compiler,
+# so they are build artefacts rather than source.
+specs/generated_*.json
+specs/llm_*.json
+specs/tmp_*.json
 
 # Office lock files (Word leaves these next to open documents)
 ~$*
