@@ -1,0 +1,10 @@
+# AirSim Python client (must match the plugin version in the UE scene)
+airsim>=1.8.1
+
+# Numerics: depth maps, occupancy grids, path geometry
+numpy>=1.24
+
+# Optional, needed only once the LLM compiler is wired in.
+# Uncomment when that module lands.
+# openai>=1.30
+# pydantic>=2.0

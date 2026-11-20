@@ -216,3 +216,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# FYP: simulator run artifacts — large, machine-specific, never commit
+# ---------------------------------------------------------------------------
+shots/
+runs/
+*.npy
+*.npz
+build_report_*.json
+assets_report.json
+*.log
+
+# Local environment / secrets
+.env.local
+settings.local.json
+
+# Office lock files (Word leaves these next to open documents)
+~$*

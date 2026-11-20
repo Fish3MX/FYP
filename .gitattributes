@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# Line endings
+#
+# This repository is edited on Windows and executed on a Linux workstation.
+# Normalise everything to LF in the repository *and* in the working copy, so a
+# file never shows up as modified just because it crossed platforms.
+#
+# Without this, Git checks text out as CRLF on Windows while storing LF, and
+# every sync produces a whole-file diff plus the "LF will be replaced by CRLF"
+# warnings.
+# ---------------------------------------------------------------------------
+* text=auto eol=lf
+
+# Source and data: always LF
+*.py      text eol=lf
+*.json    text eol=lf
+*.md      text eol=lf
+*.txt     text eol=lf
+*.sh      text eol=lf
+*.cfg     text eol=lf
+*.ini     text eol=lf
+*.yaml    text eol=lf
+*.yml     text eol=lf
+
+# Windows-only scripts really do need CRLF
+*.bat     text eol=crlf
+*.ps1     text eol=crlf
+*.cmd     text eol=crlf
+
+# ---------------------------------------------------------------------------
+# Binary: never touch these
+# ---------------------------------------------------------------------------
+*.docx    binary
+*.doc     binary
+*.pdf     binary
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.gif     binary
+*.npy     binary
+*.npz     binary
+*.zip     binary
+
+# ---------------------------------------------------------------------------
+# Linguist: keep the repo's language stats honest
+# ---------------------------------------------------------------------------
+docs/**   linguist-documentation
