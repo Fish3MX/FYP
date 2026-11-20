@@ -1,37 +1,44 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-verifier.py —— 场景的几何验证（纯 CPU，不需要 Unreal Engine / AirSim）
+"""Geometric verification of a scenario: pure CPU, no Unreal Engine, no AirSim.
 
-为什么验证器是核心贡献
-----------------------
-"让大模型生成 3D 场景"这件事本身不构成研究贡献，因为生成出来的东西
-可能根本不能用：楼是封死的（飞不进去）、目标是起点一眼就看见的（不是
-搜索任务）、路径短到没有难度。
+Why the verifier is the contribution
+------------------------------------
+"Let a large model generate a 3D scene" is not by itself a research result,
+because the result may be unusable: the building may be sealed, the target may
+be visible from take-off (so it is not a search task), or the path may be so
+short that the scenario measures nothing.
 
-本模块在**任何智能体运行之前**回答四个问题：
+This module answers four questions **before any agent runs**:
 
-  1. 可解吗？        —— 3D 占据栅格 + A* 寻路，找不到路就是生成器失败
-  2. 一开始看见了吗？—— 起点到目标的视线是否被遮挡（这决定它是不是搜索任务）
-  3. 够难吗？        —— 路径长度、绕行比是否超过阈值（平凡场景要被拒）
-  4. 需求能通过吗？  —— 每条 requirement 在真值路径上逐条检查
+  1. Is it solvable?        -- 3D occupancy grid plus A*; no path means the
+                               generator failed, not the agent.
+  2. Is it occluded at t=0? -- is the line from spawn to target blocked? This
+                               is what makes the task a search task.
+  3. Is it non-trivial?     -- path length and detour ratio against thresholds;
+                               a trivial scenario is rejected.
+  4. Are the requirements satisfiable? -- each assertion is evaluated on the
+                               ground-truth path.
 
-关键设计：不依赖引擎
---------------------
-验证只读规格书，用轴对齐包围盒（AABB）近似物体体积。这带来两个好处：
+Key design decision: no engine
+------------------------------
+Verification reads only the specification and approximates object volumes with
+axis-aligned bounding boxes. Two benefits:
 
-  * **快**：几十毫秒，可以在笔记本上批量跑
-  * **可测试**：可以写单元测试证明它真的会拒绝坏场景
+  * **fast**: tens of milliseconds, so scenarios can be screened in bulk on a
+    laptop;
+  * **testable**: unit tests can prove that it really rejects bad scenarios.
 
-代价是近似误差。这个误差不是被忽略，而是被**测量**：`--compare-engine`
-可以把验证器的判断和 AirSim 的真实碰撞结果对比（那部分需要引擎，单独做）。
+The price is approximation error. That error is not ignored but *measured*:
+comparing verifier verdicts against AirSim's real colliders requires the engine
+and is kept as a separate experiment.
 
-坐标系
-------
-规格书与内部计算全部用 ENU（x=东, y=北, z=上，米）。不出现 NED。
+Coordinates
+-----------
+Specifications and all internal computation use ENU
+(x=east, y=north, z=up, metres). NED never appears here.
 
-用法
-----
+Usage
+-----
     python src/verifier.py --spec specs/fire_floor2.json
     python src/verifier.py --spec specs/fire_floor2.json --json report.json
     python src/verifier.py --spec specs/fire_floor2.json --resolution 0.4 -v
@@ -45,35 +52,46 @@ import json
 import logging
 import math
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from asset_catalog import CATALOG
 from scene_spec import SceneObject, SceneSpec, load_spec
 
 LOG = logging.getLogger("verifier")
 
-# 无人机以中心点为基准的保守半径（米）。用于在栅格里把障碍物"膨胀"，
-# 保证寻路结果是一条真正能飞的通道，而不是贴着墙皮的零宽曲线。
+# Conservative drone radius (metres). Obstacles are inflated by this much so a
+# planned path is a corridor the drone can actually fly, not a zero-width line
+# grazing a wall.
 DEFAULT_CLEARANCE_M = 0.6
 
-# 栅格分辨率（米）。越小越精确，内存和时间按三次方增长。
+# Grid resolution (metres). Finer means more accurate but memory and time grow
+# cubically.
 DEFAULT_RESOLUTION_M = 0.5
 
-# 超过这个格子数就自动降精度，避免在 12 核机器上吃光内存。
+# Above this cell count the resolution is coarsened automatically.
 MAX_CELLS = 6_000_000
 
-# 巡航速度假设，仅用于把路径长度换算成"预计耗时"来检查 max_time_s。
+# Assumed cruise speed, used only to turn path length into an estimated duration
+# when checking max_time_s.
 ASSUMED_CRUISE_MPS = 3.0
 
+# Message emitted when the target is visible from the spawn pose. Kept as a
+# constant because tests and downstream tooling match on it.
+OCCLUSION_FAILURE = (
+    "the spawn pose can see the target directly, so the task is not a search "
+    "task (initial occlusion check failed)"
+)
+
 
 # --------------------------------------------------------------------------- #
-# 资产 -> 占位尺寸
+# Asset -> footprint
 # --------------------------------------------------------------------------- #
-# 基础几何体的尺寸由 scale 决定（1 m 单位），其余资产用各自类别的名义尺寸。
-# 这些数字是"够用就好"的保守估计，目的是让寻路不把无人机塞进比它小的缝里，
-# 而不是精确复刻美术资产。
+# Primitives take their size from `scale` (1 m units); other assets use the
+# nominal size of their category. These numbers only need to be conservative --
+# the goal is to stop the planner squeezing the drone through gaps smaller than
+# itself, not to reproduce the art asset exactly.
 CATEGORY_EXTENT_M: Dict[str, Tuple[float, float, float]] = {
     "primitive_box": (1.0, 1.0, 1.0),
     "primitive_plane": (1.0, 1.0, 0.05),
@@ -105,19 +123,19 @@ CATEGORY_EXTENT_M: Dict[str, Tuple[float, float, float]] = {
     "tent": (3.0, 3.0, 2.0),
 }
 
-# 资产名 -> 类别，由目录反推，避免手工维护第二份映射表
+# Asset name -> category, derived from the catalogue instead of maintained twice.
 ASSET_TO_CATEGORY: Dict[str, str] = {}
-for _cat in CATALOG.values():
-    for _asset in _cat.assets:
-        ASSET_TO_CATEGORY.setdefault(_asset, _cat.name)
+for _category in CATALOG.values():
+    for _asset in _category.assets:
+        ASSET_TO_CATEGORY.setdefault(_asset, _category.name)
 
 
 # --------------------------------------------------------------------------- #
-# 基础几何
+# Basic geometry
 # --------------------------------------------------------------------------- #
 @dataclass(frozen=True)
 class AABB:
-    """轴对齐包围盒，ENU 米制。"""
+    """Axis-aligned bounding box in world ENU metres."""
 
     lo: Tuple[float, float, float]
     hi: Tuple[float, float, float]
@@ -136,11 +154,13 @@ class AABB:
             tuple(self.hi[i] + margin for i in range(3)),  # type: ignore[arg-type]
         )
 
-    def contains(self, p: Sequence[float]) -> bool:
-        return all(self.lo[i] <= p[i] <= self.hi[i] for i in range(3))
+    def contains(self, point: Sequence[float]) -> bool:
+        return all(self.lo[i] <= point[i] <= self.hi[i] for i in range(3))
 
     def intersects(self, other: "AABB") -> bool:
-        return all(self.lo[i] <= other.hi[i] and other.lo[i] <= self.hi[i] for i in range(3))
+        return all(
+            self.lo[i] <= other.hi[i] and other.lo[i] <= self.hi[i] for i in range(3)
+        )
 
     def union(self, other: "AABB") -> "AABB":
         return AABB(
@@ -150,26 +170,25 @@ class AABB:
 
 
 def object_extent(spec: SceneSpec, obj: SceneObject) -> Tuple[float, float, float]:
-    """
-    估算物体的包围盒尺寸（米）。
+    """Estimate an object's bounding box size in metres.
 
-    基础几何体按 scale 精确计算；其余资产用类别名义尺寸再乘 scale。
-    找不到类别时退回 1 m 立方体——宁可高估也不要漏掉障碍。
+    Primitives are computed exactly from `scale`; everything else uses its
+    category's nominal size multiplied by `scale`. An unknown asset falls back
+    to a 1 m cube: over-estimating an obstacle is safer than missing it.
     """
-    cat = ASSET_TO_CATEGORY.get(obj.asset)
-    base = CATEGORY_EXTENT_M.get(cat or "", (1.0, 1.0, 1.0))
+    category = ASSET_TO_CATEGORY.get(obj.asset)
+    base = CATEGORY_EXTENT_M.get(category or "", (1.0, 1.0, 1.0))
     sx, sy, sz = obj.scale
     return (base[0] * sx, base[1] * sy, base[2] * sz)
 
 
 def object_aabb(spec: SceneSpec, obj: SceneObject) -> AABB:
-    """
-    物体的世界 AABB。
+    """World-space AABB of an object.
 
-    注意：这里**忽略 yaw**，即把旋转后的物体当成其轴对齐外包盒。
-    对 90° 倍数的旋转是精确的；对其他角度是保守（偏大）的近似。
-    保守意味着"可能把可通行的缝判成不可通行"，而不是反过来，
-    因此不会放过不可解场景。
+    Yaw is ignored: a rotated object is treated as its axis-aligned outer box.
+    This is exact for multiples of 90 degrees and conservative otherwise.
+    Conservative means a passable gap may be judged impassable, never the other
+    way round, so an unsolvable scenario cannot slip through.
     """
     cx, cy, cz = spec.world_position_enu(obj)
     ex, ey, ez = object_extent(spec, obj)
@@ -180,11 +199,10 @@ def object_aabb(spec: SceneSpec, obj: SceneObject) -> AABB:
 
 
 def segment_hits_aabb(p0: Sequence[float], p1: Sequence[float], box: AABB) -> bool:
-    """
-    线段与 AABB 是否相交（slab 方法）。
+    """Does the segment p0-p1 intersect the box? Slab method.
 
-    用于视线遮挡判定：从起点到目标连一条线，只要穿过任意遮挡体
-    就说明目标在初始时刻不可见。
+    Used for the line-of-sight test: if the segment from spawn to target crosses
+    any occluder, the target is not visible at t=0.
     """
     direction = [p1[i] - p0[i] for i in range(3)]
     t_min, t_max = 0.0, 1.0
@@ -210,13 +228,12 @@ def segment_hits_aabb(p0: Sequence[float], p1: Sequence[float], box: AABB) -> bo
 
 
 # --------------------------------------------------------------------------- #
-# 占据栅格
+# Occupancy grid
 # --------------------------------------------------------------------------- #
 class OccupancyGrid:
-    """
-    三维占据栅格。
+    """Dense 3D occupancy grid.
 
-    索引约定：`idx = ix + nx * (iy + ny * iz)`，iz 为高度方向。
+    Index convention: `idx = ix + nx * (iy + ny * iz)`, iz is the vertical axis.
     """
 
     def __init__(self, aabb: AABB, resolution: float) -> None:
@@ -228,7 +245,7 @@ class OccupancyGrid:
         self.nz = max(1, int(math.ceil(size[2] / self.resolution)))
         self.blocked = bytearray(self.nx * self.ny * self.nz)
 
-    # ---------- 坐标索引 ----------
+    # ---------- index arithmetic ----------
     @property
     def n_cells(self) -> int:
         return self.nx * self.ny * self.nz
@@ -236,10 +253,10 @@ class OccupancyGrid:
     def to_index(self, x: int, y: int, z: int) -> int:
         return x + self.nx * (y + self.ny * z)
 
-    def to_cell(self, p: Sequence[float]) -> Tuple[int, int, int]:
-        ix = int((p[0] - self.origin[0]) / self.resolution)
-        iy = int((p[1] - self.origin[1]) / self.resolution)
-        iz = int((p[2] - self.origin[2]) / self.resolution)
+    def to_cell(self, point: Sequence[float]) -> Tuple[int, int, int]:
+        ix = int((point[0] - self.origin[0]) / self.resolution)
+        iy = int((point[1] - self.origin[1]) / self.resolution)
+        iz = int((point[2] - self.origin[2]) / self.resolution)
         ix = min(max(ix, 0), self.nx - 1)
         iy = min(max(iy, 0), self.ny - 1)
         iz = min(max(iz, 0), self.nz - 1)
@@ -250,7 +267,7 @@ class OccupancyGrid:
             self.origin[i] + (cell[i] + 0.5) * self.resolution for i in range(3)  # type: ignore[return-value]
         )
 
-    # ---------- 占用查询 ----------
+    # ---------- occupancy queries ----------
     def is_blocked(self, cell: Tuple[int, int, int]) -> bool:
         return bool(self.blocked[self.to_index(*cell)])
 
@@ -267,31 +284,30 @@ class OccupancyGrid:
         ):
             self.blocked[self.to_index(*cell)] = 1
 
-    # ---------- 栅格化 ----------
+    # ---------- rasterisation ----------
     def rasterize(self, box: AABB) -> int:
-        """把一个 AABB 标记为占用，返回影响的格子数。"""
+        """Mark every cell touched by the box; returns the number marked."""
         lo = self.to_cell(box.lo)
         hi = self.to_cell(box.hi)
         count = 0
         for iz in range(lo[2], hi[2] + 1):
             for iy in range(lo[1], hi[1] + 1):
                 base = self.to_index(0, iy, iz)
-                row = slice(base + lo[0], base + hi[0] + 1)
-                for i in range(row.start, row.stop):
-                    if not self.blocked[i]:
-                        self.blocked[i] = 1
+                for index in range(base + lo[0], base + hi[0] + 1):
+                    if not self.blocked[index]:
+                        self.blocked[index] = 1
                         count += 1
         return count
 
     def carve(self, box: AABB) -> None:
-        """把一个 AABB 强制标记为自由（用于清出目标周围空间）。"""
+        """Force every cell touched by the box to be free."""
         lo = self.to_cell(box.lo)
         hi = self.to_cell(box.hi)
         for iz in range(lo[2], hi[2] + 1):
             for iy in range(lo[1], hi[1] + 1):
                 base = self.to_index(0, iy, iz)
-                for i in range(base + lo[0], base + hi[0] + 1):
-                    self.blocked[i] = 0
+                for index in range(base + lo[0], base + hi[0] + 1):
+                    self.blocked[index] = 0
 
 
 def build_grid(
@@ -299,15 +315,15 @@ def build_grid(
     resolution: float = DEFAULT_RESOLUTION_M,
     clearance: float = DEFAULT_CLEARANCE_M,
 ) -> Tuple[OccupancyGrid, Dict[str, AABB], Dict[str, Any]]:
-    """
-    根据规格书栅格化三维占据体。
+    """Rasterise the solid volume described by the spec.
 
-    返回 (栅格, 每个物体的 AABB, 元信息)。
-    只有 `physics=True` 的物体参与碰撞栅格——与引擎行为一致：
-    没有碰撞代理体的装饰物不会挡住无人机。
+    Returns (grid, per-object AABB, metadata). Only objects with
+    `physics=True` enter the collision grid, matching engine behaviour: a prop
+    without a collider does not block the drone.
 
-    注意：所有坐标都在**世界 ENU 系**下计算。`spawn.pos` 是相对 origin 的
-    局部坐标，必须先经 `world_spawn_enu()` 转换，否则会把两套坐标混算。
+    All coordinates are world ENU. `spawn.pos` is local to `origin`, so it goes
+    through `world_spawn_enu()` first; mixing the two frames silently produces
+    "never occluded" and nonsense path lengths.
     """
     solid: List[Tuple[str, AABB]] = []
     for obj in spec.objects:
@@ -315,7 +331,6 @@ def build_grid(
             continue
         solid.append((obj.id, object_aabb(spec, obj)))
 
-    # 计算包围范围：所有实心物体 + 起点 + 目标，全部用世界坐标
     points: List[Tuple[float, float, float]] = []
     for _, box in solid:
         points.append(box.lo)
@@ -331,44 +346,45 @@ def build_grid(
             points.append(spec.world_position_enu(goal_obj))
 
     if not points:
-        raise ValueError("规格书里既没有实心物体也没有起点/目标，无法建立栅格")
+        raise ValueError("the spec has neither solid objects nor a spawn/target")
 
     lo = tuple(min(p[i] for p in points) - 3.0 for i in range(3))
     hi = tuple(max(p[i] for p in points) + 3.0 for i in range(3))
     bounds = AABB(lo, hi)  # type: ignore[arg-type]
 
-    # 自动降精度，防止内存爆掉
+    # Coarsen automatically if the grid would be too large.
     res = float(resolution)
     while True:
-        g = OccupancyGrid(bounds, res)
-        if g.n_cells <= MAX_CELLS:
+        grid = OccupancyGrid(bounds, res)
+        if grid.n_cells <= MAX_CELLS:
             break
         res *= 1.5
-        LOG.warning("栅格过大，分辨率自动放宽到 %.2f m", res)
+        LOG.warning("grid too large, coarsening the resolution to %.2f m", res)
 
     boxes: Dict[str, AABB] = {}
     for obj_id, box in solid:
         boxes[obj_id] = box
-        g.rasterize(box.expanded(clearance))
+        grid.rasterize(box.expanded(clearance))
 
-    # 刻意不做任何"为达目标凿洞"的处理。目标如果被封在实心结构里，
-    # 就应当判定为不可解——那正是验证器要抓的生成器失败，而不是要掩盖的误差。
+    # Deliberately no carving to make the goal reachable. A target sealed inside
+    # solid structure must be reported as unsolvable: that is exactly the
+    # generator failure the verifier exists to catch, not noise to hide.
     meta = {
-        "resolution_m": g.resolution,
-        "dims": [g.nx, g.ny, g.nz],
-        "cells": g.n_cells,
-        "origin_enu": list(g.origin),
-        "blocked_cells": sum(g.blocked),
+        "resolution_m": grid.resolution,
+        "dims": [grid.nx, grid.ny, grid.nz],
+        "cells": grid.n_cells,
+        "origin_enu": list(grid.origin),
+        "blocked_cells": sum(grid.blocked),
         "solid_objects": len(solid),
         "clearance_m": clearance,
     }
-    return g, boxes, meta
+    return grid, boxes, meta
 
 
 # --------------------------------------------------------------------------- #
-# A* 寻路
+# A* path planning
 # --------------------------------------------------------------------------- #
-# 26 邻域：三个轴各 -1/0/+1，排除 (0,0,0) 本身
+# 26-connected neighbourhood: -1/0/+1 on each axis, excluding the origin.
 NEIGHBOURS: List[Tuple[int, int, int]] = [
     d for d in itertools.product((-1, 0, 1), repeat=3) if d != (0, 0, 0)
 ]
@@ -380,11 +396,10 @@ def astar(
     goal: Tuple[int, int, int],
     max_expansions: int = 2_000_000,
 ) -> Optional[List[Tuple[int, int, int]]]:
-    """
-    三维 A*。返回格子路径（含起终点），不可达时返回 None。
+    """3D A*. Returns the cell path including both endpoints, or None.
 
-    启发式用欧氏距离乘分辨率，在 26 邻域下是可采纳的（不会高估），
-    因此 A* 找到的是最优路径。
+    The heuristic is Euclidean distance times the resolution, which is
+    admissible on a 26-connected grid, so A* returns an optimal path.
     """
     if not grid.is_free(start):
         return None
@@ -395,14 +410,18 @@ def astar(
 
     res = grid.resolution
 
-    def h(c: Tuple[int, int, int]) -> float:
+    def heuristic(cell: Tuple[int, int, int]) -> float:
         return res * math.sqrt(
-            (c[0] - goal[0]) ** 2 + (c[1] - goal[1]) ** 2 + (c[2] - goal[2]) ** 2
+            (cell[0] - goal[0]) ** 2
+            + (cell[1] - goal[1]) ** 2
+            + (cell[2] - goal[2]) ** 2
         )
 
     costs: Dict[Tuple[int, int, int], float] = {start: 0.0}
     parents: Dict[Tuple[int, int, int], Tuple[int, int, int]] = {}
-    heap: List[Tuple[float, float, Tuple[int, int, int]]] = [(h(start), 0.0, start)]
+    heap: List[Tuple[float, float, Tuple[int, int, int]]] = [
+        (heuristic(start), 0.0, start)
+    ]
     closed: set = set()
     expansions = 0
 
@@ -419,123 +438,131 @@ def astar(
         closed.add(current)
         expansions += 1
         if expansions > max_expansions:
-            LOG.warning("A* 展开超过 %d 个节点，放弃", max_expansions)
+            LOG.warning("A* exceeded %d expansions, giving up", max_expansions)
             return None
 
-        for d in NEIGHBOURS:
-            nxt = (current[0] + d[0], current[1] + d[1], current[2] + d[2])
-            if nxt in closed or not grid.is_free(nxt):
+        for delta in NEIGHBOURS:
+            neighbour = (
+                current[0] + delta[0],
+                current[1] + delta[1],
+                current[2] + delta[2],
+            )
+            if neighbour in closed or not grid.is_free(neighbour):
                 continue
-            step = res * math.sqrt(d[0] ** 2 + d[1] ** 2 + d[2] ** 2)
-            ng = g_cost + step
-            if ng < costs.get(nxt, math.inf):
-                costs[nxt] = ng
-                parents[nxt] = current
-                heapq.heappush(heap, (ng + h(nxt), ng, nxt))
+            step = res * math.sqrt(delta[0] ** 2 + delta[1] ** 2 + delta[2] ** 2)
+            new_cost = g_cost + step
+            if new_cost < costs.get(neighbour, math.inf):
+                costs[neighbour] = new_cost
+                parents[neighbour] = current
+                heapq.heappush(heap, (new_cost + heuristic(neighbour), new_cost, neighbour))
 
     return None
 
 
 def path_length(points: Sequence[Sequence[float]]) -> float:
-    return sum(
-        math.dist(points[i], points[i + 1]) for i in range(len(points) - 1)
-    )
+    return sum(math.dist(points[i], points[i + 1]) for i in range(len(points) - 1))
 
 
 # --------------------------------------------------------------------------- #
-# 需求断言检查
+# Requirement checks
 # --------------------------------------------------------------------------- #
 def check_requirements(
     spec: SceneSpec,
     path_enu: Optional[Sequence[Tuple[float, float, float]]],
 ) -> List[Dict[str, Any]]:
-    """
-    逐条检查 requirements 是否可满足。
+    """Evaluate every declared requirement on the ground-truth path.
 
-    "可满足"的含义是：存在一条从起点到目标的可行路径，沿着它飞能同时
-    满足所有断言。因此这些检查建立在 A* 的真值路径上。
+    "Satisfiable" means: a feasible path exists and flying it satisfies the
+    assertion. That is why these checks are built on the A* result rather than
+    on the raw specification alone.
     """
     results: List[Dict[str, Any]] = []
 
     length = path_length(path_enu) if path_enu else None
-    estimated_time = (
-        length / ASSUMED_CRUISE_MPS if length is not None else None
-    )
+    estimated_time = length / ASSUMED_CRUISE_MPS if length is not None else None
 
-    for req in spec.requirements:
-        kind = str(req.get("kind", ""))
-        value = req.get("value")
-        passed: Optional[bool] = None
+    for requirement in spec.requirements:
+        kind = str(requirement.get("kind", ""))
+        value = requirement.get("value")
+        satisfiable: Optional[bool] = None
         detail = ""
 
         if kind == "max_time_s":
             if estimated_time is None:
-                passed, detail = False, "无法计算路径耗时（场景不可解）"
+                satisfiable, detail = False, "cannot estimate duration (unsolvable)"
             else:
-                passed = estimated_time <= float(value)
+                satisfiable = estimated_time <= float(value)
                 detail = (
-                    f"预计 {estimated_time:.1f} s"
-                    f"（{length:.1f} m / {ASSUMED_CRUISE_MPS} m/s），"
-                    f"上限 {float(value):.0f} s"
+                    f"estimated {estimated_time:.1f} s "
+                    f"({length:.1f} m / {ASSUMED_CRUISE_MPS} m/s), "
+                    f"limit {float(value):.0f} s"
                 )
 
         elif kind == "min_altitude_m":
             if path_enu is None:
-                passed, detail = False, "无法计算（场景不可解）"
+                satisfiable, detail = False, "cannot evaluate (unsolvable)"
             else:
-                lowest = min(p[2] for p in path_enu)
-                passed = lowest >= float(value)
-                detail = f"路径最低点 {lowest:.2f} m，下限 {float(value):.1f} m"
+                lowest = min(point[2] for point in path_enu)
+                satisfiable = lowest >= float(value)
+                detail = f"lowest point {lowest:.2f} m, limit {float(value):.1f} m"
 
         elif kind == "no_collision":
-            # 路径本身就走在自由栅格里，能求出路径即意味着可无碰撞通过
-            passed = path_enu is not None
-            detail = "由 A* 在膨胀后的自由空间中的可达性保证"
+            # The path lies in inflated free space, so reachability already
+            # implies a collision-free route.
+            satisfiable = path_enu is not None
+            detail = "guaranteed by reachability in the inflated free space"
 
         elif kind == "must_enter_building":
             if path_enu is None:
-                passed, detail = False, "无法计算（场景不可解）"
+                satisfiable, detail = False, "cannot evaluate (unsolvable)"
             else:
                 structures = [o for o in spec.objects if o.role == "structure"]
                 if not structures:
-                    passed, detail = False, "场景里没有结构物体"
+                    satisfiable, detail = False, "the scenario has no structures"
                 else:
                     xs = [spec.world_position_enu(o)[0] for o in structures]
                     ys = [spec.world_position_enu(o)[1] for o in structures]
                     inside = any(
-                        min(xs) <= p[0] <= max(xs) and min(ys) <= p[1] <= max(ys)
-                        for p in path_enu
+                        min(xs) <= point[0] <= max(xs)
+                        and min(ys) <= point[1] <= max(ys)
+                        for point in path_enu
                     )
-                    passed = inside
-                    detail = "路径经过建筑投影范围" if inside else "路径始终在建筑外部"
+                    satisfiable = inside
+                    detail = (
+                        "the path crosses the building footprint"
+                        if inside
+                        else "the path never enters the building footprint"
+                    )
 
         elif kind == "min_path_length_m":
             if length is None:
-                passed, detail = False, "无法计算（场景不可解）"
+                satisfiable, detail = False, "cannot evaluate (unsolvable)"
             else:
-                passed = length >= float(value)
-                detail = f"路径 {length:.1f} m，下限 {float(value):.1f} m"
+                satisfiable = length >= float(value)
+                detail = f"path {length:.1f} m, limit {float(value):.1f} m"
 
         elif kind == "max_detour_ratio":
             if length is None or spec.target is None or spec.spawn is None:
-                passed, detail = False, "无法计算（场景不可解或缺目标）"
+                satisfiable, detail = False, "cannot evaluate (unsolvable or no target)"
             else:
                 goal = spec.object_by_id(spec.target.object_id)
-                start_w = spec.world_spawn_enu()
-                goal_w = spec.world_position_enu(goal) if goal else start_w
-                straight = math.dist(start_w, goal_w)
+                start_world = spec.world_spawn_enu()
+                goal_world = (
+                    spec.world_position_enu(goal) if goal else start_world
+                )
+                straight = math.dist(start_world, goal_world)
                 ratio = length / straight if straight > 1e-6 else math.inf
-                passed = ratio <= float(value)
-                detail = f"绕行比 {ratio:.2f}，上限 {float(value):.2f}"
+                satisfiable = ratio <= float(value)
+                detail = f"detour ratio {ratio:.2f}, limit {float(value):.2f}"
 
         else:
-            passed, detail = None, f"未知的断言类型 '{kind}'，未检查"
+            satisfiable, detail = None, f"unknown requirement kind '{kind}', not checked"
 
         results.append(
             {
                 "kind": kind,
                 "value": value,
-                "satisfiable": passed,
+                "satisfiable": satisfiable,
                 "detail": detail,
             }
         )
@@ -544,7 +571,7 @@ def check_requirements(
 
 
 # --------------------------------------------------------------------------- #
-# 验证结果
+# Result object
 # --------------------------------------------------------------------------- #
 @dataclass
 class VerificationResult:
@@ -562,7 +589,7 @@ class VerificationResult:
 
     @property
     def usable(self) -> bool:
-        """能否作为测试用例使用：可解 + 有遮挡 + 没有失败项 + 断言全过。"""
+        """Usable as a test: solvable, occluded, no failures, requirements met."""
         return (
             self.solvable
             and self.initially_occluded
@@ -571,40 +598,43 @@ class VerificationResult:
         )
 
     def summary(self) -> str:
-        def yn(v: bool) -> str:
-            return "yes" if v else "NO"
+        def yes_no(value: bool) -> str:
+            return "yes" if value else "NO"
 
         lines = [
-            f"验证对象: {self.spec_name}",
-            f"  可解性          : {yn(self.solvable)}"
-            + (f"  (路径 {self.path_length_m:.1f} m)" if self.path_length_m else ""),
-            f"  初始是否被遮挡  : {yn(self.initially_occluded)}",
-            f"  直线距离        : {self.straight_distance_m:.1f} m",
-            f"  绕行比          : "
+            f"scenario: {self.spec_name}",
+            f"  solvable        : {yes_no(self.solvable)}"
+            + (f"  (path {self.path_length_m:.1f} m)" if self.path_length_m else ""),
+            f"  occluded at t=0 : {yes_no(self.initially_occluded)}",
+            f"  straight-line   : {self.straight_distance_m:.1f} m",
+            f"  detour ratio    : "
             + (f"{self.detour_ratio:.2f}" if self.detour_ratio else "n/a"),
-            f"  路径最低高度    : "
+            f"  lowest altitude : "
             + (
                 f"{self.min_path_altitude_m:.2f} m"
                 if self.min_path_altitude_m is not None
                 else "n/a"
             ),
-            f"  栅格            : {self.grid_meta['dims']} @ "
+            f"  grid            : {self.grid_meta['dims']} @ "
             f"{self.grid_meta['resolution_m']:.2f} m "
-            f"({self.grid_meta['cells']} 格, 膨胀 {self.clearance_m:.1f} m)",
+            f"({self.grid_meta['cells']} cells, clearance {self.clearance_m:.1f} m)",
         ]
 
         if self.requirement_results:
-            lines.append("  需求断言:")
-            for r in self.requirement_results:
-                mark = {True: "PASS", False: "FAIL", None: "SKIP"}[r["satisfiable"]]
-                lines.append(f"    [{mark}] {r['kind']} = {r['value']}  ({r['detail']})")
+            lines.append("  requirements:")
+            for result in self.requirement_results:
+                mark = {True: "PASS", False: "FAIL", None: "SKIP"}[result["satisfiable"]]
+                lines.append(
+                    f"    [{mark}] {result['kind']} = {result['value']}  "
+                    f"({result['detail']})"
+                )
 
         if self.failures:
-            lines.append("  结论: 不可用")
-            for f in self.failures:
-                lines.append(f"    - {f}")
+            lines.append("  verdict: NOT usable")
+            for failure in self.failures:
+                lines.append(f"    - {failure}")
         else:
-            lines.append("  结论: 可作为测试用例")
+            lines.append("  verdict: usable as a test case")
 
         return "\n".join(lines)
 
@@ -626,7 +656,7 @@ class VerificationResult:
 
 
 # --------------------------------------------------------------------------- #
-# 主验证流程
+# Main verification routine
 # --------------------------------------------------------------------------- #
 def verify(
     spec: SceneSpec,
@@ -636,33 +666,32 @@ def verify(
     min_detour_ratio: float = 1.15,
     min_path_length_m: float = 10.0,
 ) -> VerificationResult:
-    """
-    对一份规格书做完整几何验证。
+    """Run the full geometric verification of a specification.
 
-    参数
-    ----
+    Parameters
+    ----------
     resolution, clearance:
-        栅格精度与无人机安全半径。
+        Grid granularity and the drone safety radius.
     min_detour_ratio:
-        路径长度 / 直线距离 的下限。低于它说明几乎直线可达，属于平凡场景。
-        下限而非上限，因为这里要拒绝的是"太简单"。
+        Lower bound on path length divided by straight-line distance. Below it
+        the target is almost directly reachable, which is trivial. It is a lower
+        bound because the scenario being rejected is the too-easy one.
     min_path_length_m:
-        绝对路径长度下限，防止目标就在隔壁。
+        Absolute lower bound on path length, in case the target is next door.
     """
     failures: List[str] = []
 
-    # 场景必须给全起点与目标，否则无从验证
     if spec.spawn is None:
-        failures.append("缺少 spawn，无法验证可解性")
+        failures.append("missing spawn: solvability cannot be verified")
     if spec.target is None:
-        failures.append("缺少 target，无法验证可解性")
+        failures.append("missing target: solvability cannot be verified")
 
     goal_obj = (
         spec.object_by_id(spec.target.object_id) if spec.target is not None else None
     )
     if spec.target is not None and goal_obj is None:
         failures.append(
-            f"target.object_id='{spec.target.object_id}' 在 objects 中不存在"
+            f"target.object_id='{spec.target.object_id}' is not present in objects"
         )
 
     if failures:
@@ -682,41 +711,45 @@ def verify(
 
     assert spec.spawn is not None and goal_obj is not None
 
-    # 全部换算到世界 ENU 系：spawn.pos 与物体 pos 都是相对 origin 的局部坐标
+    # Everything moves to world ENU here: spawn.pos and object pos are local to
+    # origin, while occluder boxes are world-space.
     start_enu = spec.world_spawn_enu()
     goal_enu = spec.world_position_enu(goal_obj)
     straight = math.dist(start_enu, goal_enu)
 
-    # ---------- 1. 初始遮挡 ----------
+    # ---------- 1. initial occlusion ----------
     occluders = [
-        object_aabb(spec, o)
-        for o in spec.objects
-        if o.role in ("structure", "prop") and o.id != goal_obj.id
+        object_aabb(spec, obj)
+        for obj in spec.objects
+        if obj.role in ("structure", "prop") and obj.id != goal_obj.id
     ]
-    blocked_segments = [
-        b for b in occluders if segment_hits_aabb(start_enu, goal_enu, b)
-    ]
-    occluded = bool(blocked_segments)
-
-    # ---------- 2. 占据栅格 + A* ----------
-    grid, _, grid_meta = build_grid(
-        spec, resolution=resolution, clearance=clearance
+    occluded = any(
+        segment_hits_aabb(start_enu, goal_enu, box) for box in occluders
     )
+
+    # ---------- 2. occupancy grid and A* ----------
+    grid, _, grid_meta = build_grid(spec, resolution=resolution, clearance=clearance)
 
     start_cell = grid.to_cell(start_enu)
     goal_cell = grid.to_cell(goal_enu)
 
-    # 起点如果落在障碍里（例如贴地），就近找一个自由格
+    # If the spawn lands inside an obstacle (for example right on the ground),
+    # snap to the nearest free cell.
     if not grid.is_free(start_cell):
         start_cell = _nearest_free(grid, start_cell, radius=6)
 
-    # 目标格子可能被目标自身占着（人物模型带碰撞）。此时在**着陆半径内**
-    # 找一个自由格作为寻路终点 —— 这与评测协议一致：只要飞到目标附近即可，
-    # 不需要与目标重合。若整个着陆半径都被封死，那就是不可解。
+    # The goal cell may be occupied by the target's own body. In that case plan
+    # to a free cell within the landing radius -- consistent with the benchmark
+    # protocol, which only requires flying close to the target. If the whole
+    # radius is blocked, the scenario really is unsolvable.
     if not grid.is_free(goal_cell):
-        landing_cells = max(1, int(round(
-            (spec.target.landing_radius_m if spec.target else 4.0) / grid.resolution
-        )))
+        landing_cells = max(
+            1,
+            int(round(
+                (spec.target.landing_radius_m if spec.target else 4.0)
+                / grid.resolution
+            )),
+        )
         goal_cell = _nearest_free(grid, goal_cell, radius=landing_cells)
 
     cells = astar(grid, start_cell, goal_cell) if start_cell and goal_cell else None
@@ -725,42 +758,43 @@ def verify(
     path_enu: Optional[List[Tuple[float, float, float]]] = None
     length: Optional[float] = None
     detour: Optional[float] = None
-    min_alt: Optional[float] = None
+    min_altitude: Optional[float] = None
 
     if solvable and cells:
-        path_enu = [grid.to_point(c) for c in cells]
-        # 用真实起终点替换首尾，避免栅格量化带来的误差
+        path_enu = [grid.to_point(cell) for cell in cells]
+        # Replace the endpoints with the true poses to remove grid quantisation.
         path_enu[0] = tuple(start_enu)
         path_enu[-1] = tuple(goal_enu)
         length = path_length(path_enu)
         detour = length / straight if straight > 1e-6 else math.inf
-        min_alt = min(p[2] for p in path_enu)
+        min_altitude = min(point[2] for point in path_enu)
     else:
-        failures.append("A* 找不到从起点到目标的可行路径（场景不可解）")
+        failures.append("A* found no feasible path from spawn to target (unsolvable)")
 
-    # ---------- 3. 非平凡性 ----------
+    # ---------- 3. non-triviality ----------
     if solvable and length is not None:
         if length < min_path_length_m:
             failures.append(
-                f"路径仅 {length:.1f} m，短于下限 {min_path_length_m:.0f} m，任务过于简单"
+                f"the path is only {length:.1f} m, below the {min_path_length_m:.0f} m "
+                f"minimum: the task is too easy"
             )
         if detour is not None and detour < min_detour_ratio:
             failures.append(
-                f"绕行比仅 {detour:.2f}（下限 {min_detour_ratio:.2f}），几乎直线可达，"
-                f"不构成搜索任务"
+                f"detour ratio is only {detour:.2f} (minimum {min_detour_ratio:.2f}): "
+                f"the target is almost directly reachable, so this is not a search task"
             )
 
-    # ---------- 4. 遮挡是搜索任务的必要条件 ----------
+    # ---------- 4. occlusion is what makes it a search task ----------
     if not occluded:
-        failures.append(
-            "起点可以直线看到目标，任务不是搜索任务（初始遮挡检查失败）"
-        )
+        failures.append(OCCLUSION_FAILURE)
 
-    # ---------- 5. 需求断言 ----------
+    # ---------- 5. requirement satisfiability ----------
     requirement_results = check_requirements(spec, path_enu)
-    for r in requirement_results:
-        if r["satisfiable"] is False:
-            failures.append(f"需求 '{r['kind']}' 无法满足: {r['detail']}")
+    for result in requirement_results:
+        if result["satisfiable"] is False:
+            failures.append(
+                f"requirement '{result['kind']}' cannot be satisfied: {result['detail']}"
+            )
 
     return VerificationResult(
         spec_name=spec.name,
@@ -769,7 +803,7 @@ def verify(
         path_length_m=length,
         straight_distance_m=straight,
         detour_ratio=detour,
-        min_path_altitude_m=min_alt,
+        min_path_altitude_m=min_altitude,
         requirement_results=requirement_results,
         failures=failures,
         grid_meta=grid_meta,
@@ -782,70 +816,73 @@ def _nearest_free(
     cell: Tuple[int, int, int],
     radius: int = 6,
 ) -> Optional[Tuple[int, int, int]]:
-    """在给定格子附近螺旋搜索一个自由格。"""
+    """Spiral outward from a cell until a free one is found."""
     if grid.is_free(cell):
         return cell
     for r in range(1, radius + 1):
-        for d in itertools.product(range(-r, r + 1), repeat=3):
-            cand = (cell[0] + d[0], cell[1] + d[1], cell[2] + d[2])
-            if grid.is_free(cand):
-                return cand
+        for delta in itertools.product(range(-r, r + 1), repeat=3):
+            candidate = (cell[0] + delta[0], cell[1] + delta[1], cell[2] + delta[2])
+            if grid.is_free(candidate):
+                return candidate
     return None
 
 
 # --------------------------------------------------------------------------- #
-# 入口
+# Entry point
 # --------------------------------------------------------------------------- #
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    ap = argparse.ArgumentParser(
-        description="场景几何验证：可解性、初始遮挡、非平凡性、需求可满足性",
+    parser = argparse.ArgumentParser(
+        description=(
+            "Geometric verification: solvability, initial occlusion, "
+            "non-triviality, requirement satisfiability"
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    ap.add_argument("--spec", required=True, help="规格书 JSON 路径")
-    ap.add_argument("--resolution", type=float, default=DEFAULT_RESOLUTION_M)
-    ap.add_argument("--clearance", type=float, default=DEFAULT_CLEARANCE_M)
-    ap.add_argument("--min-detour", type=float, default=1.15)
-    ap.add_argument("--min-path-length", type=float, default=10.0)
-    ap.add_argument("--json", default="", help="把结果写入 JSON 文件")
-    ap.add_argument("-v", "--verbose", action="store_true")
-    a = ap.parse_args(argv)
+    parser.add_argument("--spec", required=True, help="path to the specification JSON")
+    parser.add_argument("--resolution", type=float, default=DEFAULT_RESOLUTION_M)
+    parser.add_argument("--clearance", type=float, default=DEFAULT_CLEARANCE_M)
+    parser.add_argument("--min-detour", type=float, default=1.15)
+    parser.add_argument("--min-path-length", type=float, default=10.0)
+    parser.add_argument("--json", default="", help="write the report to this path")
+    parser.add_argument("-v", "--verbose", action="store_true")
+    args = parser.parse_args(argv)
 
-    # Windows 控制台默认 CP936，会把中文输出变成乱码
-    for _stream in (sys.stdout, sys.stderr):
+    # Windows consoles default to CP936 and mangle UTF-8 output.
+    for stream in (sys.stdout, sys.stderr):
         try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
         except (AttributeError, ValueError):
             pass
 
     logging.basicConfig(
-        level=logging.DEBUG if a.verbose else logging.INFO,
+        level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
 
     try:
-        spec = load_spec(a.spec)
+        spec = load_spec(args.spec)
     except Exception as exc:  # noqa: BLE001
-        LOG.error("规格书加载失败: %s", exc)
+        LOG.error("cannot load the specification: %s", exc)
         return 2
 
     result = verify(
         spec,
-        resolution=a.resolution,
-        clearance=a.clearance,
-        min_detour_ratio=a.min_detour,
-        min_path_length_m=a.min_path_length,
+        resolution=args.resolution,
+        clearance=args.clearance,
+        min_detour_ratio=args.min_detour,
+        min_path_length_m=args.min_path_length,
     )
 
     print(result.summary())
 
-    if a.json:
-        Path(a.json).parent.mkdir(parents=True, exist_ok=True)
-        Path(a.json).write_text(
+    if args.json:
+        Path(args.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json).write_text(
             json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        LOG.info("报告已写入 %s", a.json)
+        LOG.info("report written to %s", args.json)
 
     return 0 if result.usable else 1
 

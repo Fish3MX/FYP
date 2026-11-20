@@ -1,48 +1,51 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-asset_catalog.py —— 场景可用的语义资产目录
+"""Semantic asset catalogue: the vocabulary a scenario generator may use.
 
-为什么需要这一层
-----------------
-`simListAssets()` 返回 487 个名字，其中大量是招牌、邮筒、下水道盖这类
-对测试场景没有意义的装饰物。如果把这些原样丢给大模型，会产生两个问题：
+Why this layer exists
+---------------------
+`simListAssets()` returns around 487 names, most of them street dressing
+(posters, mailboxes, sewer caps) that is useless for a test scenario. Passing
+that raw list to a language model causes two problems:
 
-  1. **信噪比太低**：模型要在 487 个字符串里挑，容易挑错或拼错；
-  2. **语义失配**：模型看到 `SM_signs_poster_smoothies` 并不知道它多大、
-     能不能当墙用。
+  1. **Signal-to-noise**: the model has to pick from 487 opaque strings and
+     frequently misspells or invents one.
+  2. **No semantics**: a name like `SM_signs_poster_smoothies` says nothing
+     about how large the object is or whether it can serve as a wall.
 
-所以本模块把原始资产名收敛成**带语义的类别**：每个类别给出
-  - 一组可互换的具体资产名（实际生成时随机或顺序取用）
-  - 该类别默认的物理属性（结构必须带碰撞，装饰物不需要）
-  - 该类别在规格书里的 role（structure / prop / target / hazard）
-  - 大致的真实尺寸，供模型估算排版
+This module collapses the raw names into semantic categories. Each category
+provides:
 
-规格书里只允许写本目录里出现过的资产名。这条约束在
-`llm_compiler.py` 里强制执行，也被 `scene_builder.py` 的资产预检兜底。
+  - a set of interchangeable asset names (instantiated in order or at random)
+  - the default physics flag (structure must collide, decoration need not)
+  - the role the category should carry in a specification
+  - an approximate real-world size, so the model can lay things out sensibly
 
-单位说明
---------
-所有长度单位为米。基础几何体（Cube / Plane / Sphere / Cylinder / Cone）
-在 UE 默认工程中边长/直径约 1 m，因此 scale=1 表示 1 米；其他资产按
-其原始建模尺寸，scale 只做整体缩放。
+Only assets listed here may appear in a specification. That constraint is
+enforced by `llm_compiler`, and backed up by the asset pre-check in
+`scene_builder`.
+
+Units
+-----
+All lengths are metres. The base primitives (Cube / Plane / Sphere / Cylinder /
+Cone) are about 1 m across at scale 1, so scale is effectively a size in metres
+for those. Other assets keep their modelled size and scale only multiplies it.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence
 
 
 @dataclass(frozen=True)
 class AssetCategory:
-    """一个语义类别及其可用资产。"""
+    """A semantic category and the concrete assets that can stand in for it."""
 
     name: str
     assets: Sequence[str]
     role: str = "prop"          # structure / prop / target / hazard
-    physics: bool = False       # 是否默认带碰撞
-    unit_size_m: str = "n/a"    # 大致尺寸描述，给模型做排版参考
-    note: str = ""              # 类别用途说明
+    physics: bool = False       # collides by default
+    unit_size_m: str = "n/a"    # approximate size, for layout reasoning
+    note: str = ""              # what the category is for
 
     def to_prompt_line(self) -> str:
         assets = ", ".join(self.assets)
@@ -50,62 +53,61 @@ class AssetCategory:
         if self.physics:
             bits.append("physics=true")
         if self.unit_size_m != "n/a":
-            bits.append(f"size≈{self.unit_size_m}")
-        head = " | ".join(bits)
-        line = f"- {head}\n    assets: {assets}"
+            bits.append(f"size~{self.unit_size_m}")
+        line = f"- {' | '.join(bits)}\n    assets: {assets}"
         if self.note:
             line += f"\n    usage: {self.note}"
         return line
 
 
 # --------------------------------------------------------------------------- #
-# 目录本身
+# The catalogue
 # --------------------------------------------------------------------------- #
-# 顺序按"搭场景时的常用程度"排，越靠前越常用。
+# Ordered by how often a scenario builder needs the category.
 CATALOG: Dict[str, AssetCategory] = {
-    # ============ 基础几何体：最可靠，永远能生成 ============
+    # ======== primitives: always available, exact dimensions ========
     "primitive_box": AssetCategory(
         name="primitive_box",
         assets=["Cube"],
         role="structure",
         physics=True,
-        unit_size_m="1 m 立方体，靠 scale 拉伸",
-        note="搭墙体、楼板、台阶、障碍物的首选。scale=[长,宽,高] 以米为单位。",
+        unit_size_m="1 m cube, stretched by scale",
+        note="First choice for walls, floors and obstacles. scale=[length,width,height] in metres.",
     ),
     "primitive_plane": AssetCategory(
         name="primitive_plane",
         assets=["Plane"],
         role="structure",
         physics=True,
-        unit_size_m="1 m 平板",
-        note="地面、屋顶、薄板。",
+        unit_size_m="1 m quad",
+        note="Ground, roof, thin slabs.",
     ),
     "primitive_sphere": AssetCategory(
         name="primitive_sphere",
         assets=["Sphere"],
         role="hazard",
         physics=False,
-        unit_size_m="1 m 直径",
-        note="做标记点、火源示意、目标占位。",
+        unit_size_m="1 m diameter",
+        note="Marker point, fire indication, target placeholder.",
     ),
     "primitive_cylinder": AssetCategory(
         name="primitive_cylinder",
         assets=["Cylinder"],
         role="structure",
         physics=True,
-        unit_size_m="1 m 直径 x 1 m 高",
-        note="柱子、管道、圆形障碍。",
+        unit_size_m="1 m diameter x 1 m tall",
+        note="Columns, pipes, round obstacles.",
     ),
     "primitive_cone": AssetCategory(
         name="primitive_cone",
         assets=["Cone"],
         role="hazard",
         physics=True,
-        unit_size_m="1 m 高",
-        note="路锥、警示标记。",
+        unit_size_m="1 m tall",
+        note="Traffic cone, warning marker.",
     ),
 
-    # ============ 建筑结构：模块化构件 ============
+    # ======== building structure: modular kit ========
     "wall": AssetCategory(
         name="wall",
         assets=[
@@ -117,8 +119,8 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="structure",
         physics=True,
-        unit_size_m="3~5 m 宽，一层高",
-        note="整段墙体。需要精确尺寸控制时优先用 primitive_box。",
+        unit_size_m="3-5 m wide, one storey tall",
+        note="Full wall segments. Prefer primitive_box when exact dimensions matter.",
     ),
     "window": AssetCategory(
         name="window",
@@ -135,8 +137,8 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=False,
-        unit_size_m="2~4 m 宽",
-        note="贴在墙面上做视觉细节与视线遮挡。lvl1/lvl2/lvl3 对应楼层。",
+        unit_size_m="2-4 m wide",
+        note="Mounted on a wall for visual detail and occlusion. lvl1/lvl2/lvl3 select the storey.",
     ),
     "door": AssetCategory(
         name="door",
@@ -150,16 +152,16 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=False,
-        unit_size_m="1~2 m 宽",
-        note="入口。注意：门本身不挡路，墙体要留出缺口才飞得进去。",
+        unit_size_m="1-2 m wide",
+        note="Entrance. The door itself does not block flight; the wall must have a real gap.",
     ),
     "stairs": AssetCategory(
         name="stairs",
         assets=["SM_stairs_with_loops"],
         role="prop",
         physics=True,
-        unit_size_m="一层楼梯",
-        note="楼层之间。若担心尺寸不确定，可用 primitive_box 叠出阶梯。",
+        unit_size_m="one storey of steps",
+        note="Between floors. If the size is uncertain, stack primitive_box steps instead.",
     ),
     "pillar": AssetCategory(
         name="pillar",
@@ -173,8 +175,8 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="structure",
         physics=True,
-        unit_size_m="0.4 m 见方，3~6 m 高",
-        note="承重柱、廊柱，也可做飞行障碍。",
+        unit_size_m="0.4 m square, 3-6 m tall",
+        note="Load-bearing columns, also useful as flight obstacles.",
     ),
     "awning": AssetCategory(
         name="awning",
@@ -187,11 +189,11 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=False,
-        unit_size_m="2.5~5 m 宽",
-        note="雨棚，做建筑立面细节。",
+        unit_size_m="2.5-5 m wide",
+        note="Facade detail.",
     ),
 
-    # ============ 地面 ============
+    # ======== ground ========
     "ground_panel": AssetCategory(
         name="ground_panel",
         assets=[
@@ -203,11 +205,11 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="structure",
         physics=True,
-        unit_size_m="数米见方",
-        note="铺装地面。大范围地面用 primitive_plane 更省事。",
+        unit_size_m="a few metres square",
+        note="Paving. For large areas, primitive_plane is cheaper.",
     ),
 
-    # ============ 目标：人物 ============
+    # ======== targets: people ========
     "person": AssetCategory(
         name="person",
         assets=[
@@ -222,8 +224,8 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="target",
         physics=True,
-        unit_size_m="1.7~1.8 m 高",
-        note="被搜索的人。role=target 时必须指定到 target.object_id。",
+        unit_size_m="1.7-1.8 m tall",
+        note="The person to be found. role=target must be referenced by target.object_id.",
     ),
     "statue": AssetCategory(
         name="statue",
@@ -237,29 +239,29 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="target",
         physics=True,
-        unit_size_m="1~2 m",
-        note="人物类资产的静态替补，生成失败时可用。",
+        unit_size_m="1-2 m",
+        note="Static fallback if a character asset cannot be spawned.",
     ),
 
-    # ============ 危险源 ============
+    # ======== hazards ========
     "light_marker": AssetCategory(
         name="light_marker",
         assets=["PointLightBP", "SpotLightBP"],
         role="hazard",
         physics=False,
-        unit_size_m="点/聚光源",
-        note="做火光的视觉示意。这是当前资产库里最接近'着火'效果的东西。",
+        unit_size_m="point / spot light",
+        note="Visual stand-in for fire. The closest thing to flames in this asset set.",
     ),
     "fireplace": AssetCategory(
         name="fireplace",
         assets=["SM_Fireplace_01a", "SM_CookingStove_01"],
         role="hazard",
         physics=True,
-        unit_size_m="1~2 m",
-        note="有火焰造型的静态模型，可当作火源实体。",
+        unit_size_m="1-2 m",
+        note="Static model with a flame shape, usable as a fire source.",
     ),
 
-    # ============ 障碍与杂物 ============
+    # ======== clutter and obstacles ========
     "crate": AssetCategory(
         name="crate",
         assets=[
@@ -272,8 +274,8 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=True,
-        unit_size_m="0.5~1 m",
-        note="室内外杂物，做通行障碍与遮挡。",
+        unit_size_m="0.5-1 m",
+        note="Indoor and outdoor clutter; blocks movement and sight.",
     ),
     "rubble": AssetCategory(
         name="rubble",
@@ -287,8 +289,8 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=True,
-        unit_size_m="1~3 m",
-        note="坍塌后的废墟堆，适合灾害场景。",
+        unit_size_m="1-3 m",
+        note="Collapse debris, suited to disaster scenarios.",
     ),
     "road_barrier": AssetCategory(
         name="road_barrier",
@@ -300,11 +302,11 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=True,
-        unit_size_m="1~2 m",
-        note="路障、锥桶，做地面通行限制。",
+        unit_size_m="1-2 m",
+        note="Barriers and cones restricting ground movement.",
     ),
 
-    # ============ 载具 ============
+    # ======== vehicles ========
     "car": AssetCategory(
         name="car",
         assets=[
@@ -314,27 +316,27 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=True,
-        unit_size_m="4~5 m 长",
-        note="街道载具。可作为搜救目标或遮挡物。",
+        unit_size_m="4-5 m long",
+        note="Street vehicles, usable as a search target or as cover.",
     ),
     "bicycle": AssetCategory(
         name="bicycle",
         assets=["SM_Bicycle_01", "SM_Bicycle_02"],
         role="prop",
         physics=True,
-        unit_size_m="1.8 m 长",
-        note="小型街道道具。",
+        unit_size_m="1.8 m long",
+        note="Small street prop.",
     ),
     "cart": AssetCategory(
         name="cart",
         assets=["SM_Cart_v1_low", "SM_food_cart"],
         role="prop",
         physics=True,
-        unit_size_m="1.5~2.5 m",
-        note="推车、餐车，街边障碍。",
+        unit_size_m="1.5-2.5 m",
+        note="Hand cart, food cart; street-side obstacle.",
     ),
 
-    # ============ 植被 ============
+    # ======== vegetation ========
     "tree": AssetCategory(
         name="tree",
         assets=[
@@ -348,8 +350,8 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=True,
-        unit_size_m="5~12 m 高",
-        note="乔木。冠层可作为空中遮挡，影响视线与航线。",
+        unit_size_m="5-12 m tall",
+        note="Canopy occludes sight lines and flight paths at altitude.",
     ),
     "bush": AssetCategory(
         name="bush",
@@ -362,8 +364,8 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=True,
-        unit_size_m="1~3 m",
-        note="灌木，地面遮挡。",
+        unit_size_m="1-3 m",
+        note="Ground-level occlusion.",
     ),
     "grass": AssetCategory(
         name="grass",
@@ -376,11 +378,11 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=False,
-        unit_size_m="1~3 m",
-        note="纯装饰，不影响飞行。",
+        unit_size_m="1-3 m",
+        note="Decoration only; does not affect flight.",
     ),
 
-    # ============ 街道设施 ============
+    # ======== street furniture ========
     "street_light": AssetCategory(
         name="street_light",
         assets=[
@@ -391,8 +393,8 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=True,
-        unit_size_m="6~9 m 高",
-        note="路灯。高度与无人机飞行高度重叠，是天然障碍。",
+        unit_size_m="6-9 m tall",
+        note="Street lamps. Their height overlaps typical drone altitude, so they are natural obstacles.",
     ),
     "street_prop": AssetCategory(
         name="street_prop",
@@ -412,24 +414,29 @@ CATALOG: Dict[str, AssetCategory] = {
         ],
         role="prop",
         physics=True,
-        unit_size_m="1~3 m",
-        note="长椅、垃圾桶、消防栓、公交站牌、电话亭等街道细节。",
+        unit_size_m="1-3 m",
+        note="Benches, bins, hydrants, bus stops, phone booths and similar detail.",
     ),
 
-    # ============ 户外 / 临时营地 ============
+    # ======== outdoor / temporary structures ========
     "tent": AssetCategory(
         name="tent",
-        assets=["SM_Tent_01b", "SM_PicnicTable_01", "SM_LawnChair_01", "SM_TableCloth_01a"],
+        assets=[
+            "SM_Tent_01b",
+            "SM_PicnicTable_01",
+            "SM_LawnChair_01",
+            "SM_TableCloth_01a",
+        ],
         role="prop",
         physics=True,
-        unit_size_m="2~3 m",
-        note="户外营地，适合野外搜救场景。",
+        unit_size_m="2-3 m",
+        note="Field camp, suited to wilderness search-and-rescue.",
     ),
 }
 
 
 # --------------------------------------------------------------------------- #
-# 查询接口
+# Query interface
 # --------------------------------------------------------------------------- #
 def category_names() -> List[str]:
     return list(CATALOG.keys())
@@ -437,37 +444,35 @@ def category_names() -> List[str]:
 
 def get(name: str) -> AssetCategory:
     if name not in CATALOG:
-        raise KeyError(
-            f"未知资产类别 '{name}'。可用类别: {sorted(CATALOG)}"
-        )
+        raise KeyError(f"unknown asset category '{name}'. Available: {sorted(CATALOG)}")
     return CATALOG[name]
 
 
 def all_assets() -> List[str]:
-    """目录中出现的所有具体资产名（去重并保持顺序）。"""
+    """Every concrete asset name in the catalogue, de-duplicated, order kept."""
     seen: Dict[str, None] = {}
-    for cat in CATALOG.values():
-        for a in cat.assets:
-            seen.setdefault(a, None)
+    for category in CATALOG.values():
+        for asset in category.assets:
+            seen.setdefault(asset, None)
     return list(seen.keys())
 
 
 def whitelist() -> frozenset:
-    """允许出现在规格书里的资产名集合。"""
+    """The set of asset names allowed in a specification."""
     return frozenset(all_assets())
 
 
 def asset_role(asset: str) -> Optional[str]:
-    for cat in CATALOG.values():
-        if asset in cat.assets:
-            return cat.role
+    for category in CATALOG.values():
+        if asset in category.assets:
+            return category.role
     return None
 
 
 def asset_default_physics(asset: str) -> bool:
-    for cat in CATALOG.values():
-        if asset in cat.assets:
-            return cat.physics
+    for category in CATALOG.values():
+        if asset in category.assets:
+            return category.physics
     return False
 
 
@@ -476,33 +481,33 @@ def categories_for_role(role: str) -> List[str]:
 
 
 def prompt_text(include_usage: bool = True) -> str:
-    """
-    生成给大模型看的资产目录文本。
+    """Render the catalogue for a language model prompt.
 
-    刻意保持紧凑：类别名 + role + 尺寸 + 资产名，不用 JSON，
-    因为自然语言列表对模型的约束效果更好，也更容易被引用。
+    Deliberately compact prose rather than JSON: a natural-language list is
+    easier for a model to respect ("use only these") and easier to quote back.
     """
     lines = ["Available asset categories (use ONLY these names):"]
-    for cat in CATALOG.values():
+    for category in CATALOG.values():
         if not include_usage:
             lines.append(
-                f"- `{cat.name}` (role={cat.role}"
-                f"{', physics=true' if cat.physics else ''}"
-                f"{f', size≈{cat.unit_size_m}' if cat.unit_size_m != 'n/a' else ''})"
-                f" -> {', '.join(cat.assets)}"
+                f"- `{category.name}` (role={category.role}"
+                f"{', physics=true' if category.physics else ''}"
+                f"{f', size~{category.unit_size_m}' if category.unit_size_m != 'n/a' else ''})"
+                f" -> {', '.join(category.assets)}"
             )
         else:
-            lines.append(cat.to_prompt_line())
+            lines.append(category.to_prompt_line())
     return "\n".join(lines)
 
 
 def compact_table() -> str:
-    """极简表格版，用于在终端打印核对。"""
+    """One line per category, for eyeballing in a terminal."""
     rows = []
-    for cat in CATALOG.values():
+    for category in CATALOG.values():
         rows.append(
-            f"{cat.name:<18} role={cat.role:<10} physics={str(cat.physics):<5} "
-            f"n={len(cat.assets):<3} {cat.unit_size_m}"
+            f"{category.name:<18} role={category.role:<10} "
+            f"physics={str(category.physics):<5} "
+            f"n={len(category.assets):<3} {category.unit_size_m}"
         )
     return "\n".join(rows)
 
@@ -510,21 +515,24 @@ def compact_table() -> str:
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="查看资产目录")
-    ap.add_argument("--prompt", action="store_true", help="打印给大模型看的目录文本")
-    ap.add_argument("--assets", action="store_true", help="打印去重后的资产名列表")
-    ap.add_argument("--check", nargs="*", metavar="ASSET", help="检查资产是否在目录内")
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Inspect the asset catalogue")
+    parser.add_argument("--prompt", action="store_true", help="print the model prompt text")
+    parser.add_argument("--assets", action="store_true", help="print the flat asset list")
+    parser.add_argument(
+        "--check", nargs="*", metavar="ASSET",
+        help="check whether assets are in the catalogue",
+    )
+    args = parser.parse_args()
 
-    if a.prompt:
+    if args.prompt:
         print(prompt_text())
-    elif a.assets:
+    elif args.assets:
         for name in all_assets():
             print(name)
-    elif a.check is not None:
-        wl = whitelist()
-        for name in a.check:
-            print(f"{'OK   ' if name in wl else 'MISS '} {name}")
+    elif args.check is not None:
+        allowed = whitelist()
+        for name in args.check:
+            print(f"{'OK   ' if name in allowed else 'MISS '} {name}")
     else:
-        print(f"共 {len(CATALOG)} 个类别，{len(all_assets())} 个资产\n")
+        print(f"{len(CATALOG)} categories, {len(all_assets())} assets\n")
         print(compact_table())

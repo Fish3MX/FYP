@@ -214,7 +214,7 @@ No API key needed to try the pipeline end to end:
 
 ```bash
 python src/asset_catalog.py                      # browse the allowed vocabulary
-python src/llm_compiler.py --request "着火的二层公寓里搜索伤员" \
+python src/llm_compiler.py --request "fire in a two-storey apartment, searching for a survivor" \
        --offline --out specs/generated_fire.json  # deterministic template
 python src/scene_builder.py --spec specs/generated_fire.json --dry-run
 ```
@@ -272,17 +272,6 @@ instead of half-building a scene and reporting 15 separate spawn errors.
 | Geometric verifier: solvability, occlusion, non-triviality | done |
 | Episode runner + metrics (SR / OSR / SPL / NE) | planned |
 | Difficulty-parameter sweep | planned |
-
----
-
-## 中文速览
-
-- **目标**：让大模型把"一句话测试需求"变成 AirSim 里可飞行的测试场景。
-- **分工**：LLM 负责规划（决定放什么、放哪里），AirSim 负责施工（渲染和物理）。
-- **为什么不是"大模型直接生成 3D"**：生成式 mesh 没有碰撞体、没有真实尺度，
-  飞不进去。所以场景是**编译**出来的，不是生成出来的 —— 编译才能验证。
-- **当前进度**：控制链路已打通，规格书与构建器已就绪，下一步接 LLM。
-- **跑起来**：见上面 Quick start 的四步。
 
 ---
 
