@@ -56,7 +56,9 @@ Project/
 │   └── scene_builder.py     # spec -> AirSim objects (spawn, cleanup, readback)
 ├── scripts/
 │   ├── hello_uav.py         # minimal loop: connect, take off, fly, capture, land
-│   └── probe_assets.py      # probe which assets can be spawned at runtime
+│   ├── probe_assets.py      # probe which assets can be spawned at runtime
+│   ├── check_llm.py         # verify the LLM endpoint before compiling anything
+│   └── batch_compile.py     # batch requests, acceptance rate, failure taxonomy
 ├── specs/
 │   └── fire_floor2.json     # hand-written reference scenario
 ├── tests/
@@ -101,6 +103,34 @@ specific diagnosis: bad key, wrong base URL, unknown model, quota, or an
 unreachable network.
 
 Never commit a key. If one leaks, revoke it in the provider's console.
+
+## Batch experiments
+
+RQ2 is a quantitative claim — "generation can be made verifiable" — so it needs
+numbers, not anecdotes. `scripts/batch_compile.py` runs a request set through the
+production compile loop and reports acceptance rate, retries and a failure
+taxonomy.
+
+```bash
+# quick sanity batch
+python scripts/batch_compile.py --limit 3 --tag smoke
+
+# the paper run
+python scripts/batch_compile.py --trials 3 --tag full
+
+# the ablation: identical model and prompts, geometric gate removed
+python scripts/batch_compile.py --trials 3 --no-verify --tag ablation
+
+# the control: deterministic template instead of a model
+python scripts/batch_compile.py --template --tag template
+```
+
+It writes `runs/batch_<timestamp>_<tag>/` containing every accepted spec, a
+`results.csv` (one row per request×trial), `summary.json` and `failures.log`.
+`runs/` is git-ignored, so a batch never pollutes the repository.
+
+The four runs above give the comparison table the evaluation needs: with and
+without verification, and model versus template, on the same request set.
 
 ## Testing
 
@@ -311,6 +341,8 @@ instead of half-building a scene and reporting 15 separate spawn errors.
 | Geometric verifier: solvability, occlusion, non-triviality | done |
 | Verifier wired into the retry loop, with ablation flag | done |
 | Credential handling via environment or git-ignored `.env` | done |
+| Batch harness: acceptance rate, retries, failure taxonomy | done |
+| End-to-end run with a real model | done (1 scenario, first attempt) |
 | Episode runner + metrics (SR / OSR / SPL / NE) | next |
 | Difficulty-parameter sweep | planned |
 
