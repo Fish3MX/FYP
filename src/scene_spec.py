@@ -159,6 +159,29 @@ class SceneSpec:
             self.origin[2] + obj.pos[2],
         )
 
+    def world_point_enu(
+        self, local: Sequence[float]
+    ) -> Tuple[float, float, float]:
+        """
+        任意局部坐标点 -> 世界 ENU 坐标。
+
+        `spawn.pos` 与物体 `pos` 都是**相对 origin** 的局部坐标。任何与
+        "世界坐标下的物体包围盒"相关的计算（视线遮挡、栅格化、寻路）都必须
+        先经过这里。混用两套坐标的症状是：遮挡检查永远返回"未遮挡"，
+        路径长度也对不上。
+        """
+        return (
+            self.origin[0] + float(local[0]),
+            self.origin[1] + float(local[1]),
+            self.origin[2] + float(local[2]),
+        )
+
+    def world_spawn_enu(self) -> Optional[Tuple[float, float, float]]:
+        """无人机起点的世界 ENU 坐标；没有 spawn 时返回 None。"""
+        if self.spawn is None:
+            return None
+        return self.world_point_enu(self.spawn.pos)
+
     def asset_histogram(self) -> Dict[str, int]:
         hist: Dict[str, int] = {}
         for o in self.objects:
@@ -196,6 +219,31 @@ def _as_vec3(value: Any, where: str, problems: List[str]) -> Tuple[float, float,
     except (TypeError, ValueError):
         problems.append(f"{where}: 元素必须是数字，得到 {value!r}")
         return (0.0, 0.0, 0.0)
+
+
+def _as_float(
+    value: Any, where: str, problems: List[str], default: float = 0.0
+) -> float:
+    """
+    宽松地转成 float。
+
+    语言模型经常把数字写成字符串（"4.0"）甚至带单位（"4 m"）。这里接受
+    纯数字和数字字符串，其余记一条问题并返回默认值，让校验继续跑完 ——
+    一次报全所有问题，比遇到第一个类型错误就崩掉更有用。
+    """
+    if isinstance(value, bool):  # bool 是 int 的子类，先挡住
+        problems.append(f"{where}: 期望数字，得到布尔值 {value!r}")
+        return default
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            problems.append(f"{where}: 期望数字，得到字符串 {value!r}")
+            return default
+    problems.append(f"{where}: 期望数字，得到 {value!r}")
+    return default
 
 
 def parse_spec(data: Dict[str, Any]) -> SceneSpec:
@@ -294,7 +342,12 @@ def parse_spec(data: Dict[str, Any]) -> SceneSpec:
                 problems.append(
                     f"target.object_id: '{tid}' 不在 objects 里（必须是某个物体的 id）"
                 )
-            radius = float(raw_target.get("landing_radius_m", 5.0))
+            radius = _as_float(
+                raw_target.get("landing_radius_m", 5.0),
+                "target.landing_radius_m",
+                problems,
+                default=5.0,
+            )
             if radius <= 0:
                 problems.append("target.landing_radius_m: 必须 > 0")
             target = Target(object_id=tid, landing_radius_m=radius)
@@ -307,7 +360,9 @@ def parse_spec(data: Dict[str, Any]) -> SceneSpec:
             problems.append("spawn: 必须是对象")
         else:
             spos = _as_vec3(raw_spawn.get("pos", [0, 0, 0]), "spawn.pos", problems)
-            syaw = float(raw_spawn.get("yaw_deg", 0.0))
+            syaw = _as_float(
+                raw_spawn.get("yaw_deg", 0.0), "spawn.yaw_deg", problems, default=0.0
+            )
             spawn = Spawn(pos=spos, yaw_deg=syaw)
 
     # ---- requirements ----

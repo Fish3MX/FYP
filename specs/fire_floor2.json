@@ -5,6 +5,14 @@
   "origin": [25.0, 0.0, 0.0],
   "objects": [
     {
+      "id": "ground_base",
+      "asset": "Cube",
+      "pos": [0.0, 0.0, -0.4],
+      "scale": [24.0, 20.0, 1.2],
+      "physics": true,
+      "role": "structure"
+    },
+    {
       "id": "floor_ground",
       "asset": "Cube",
       "pos": [0.0, 0.0, 0.1],
@@ -13,10 +21,34 @@
       "role": "structure"
     },
     {
-      "id": "floor_second",
+      "id": "floor_second_north",
       "asset": "Cube",
-      "pos": [0.0, 0.0, 3.1],
-      "scale": [12.0, 8.0, 0.2],
+      "pos": [0.0, 3.0, 3.1],
+      "scale": [12.0, 2.0, 0.2],
+      "physics": true,
+      "role": "structure"
+    },
+    {
+      "id": "floor_second_south",
+      "asset": "Cube",
+      "pos": [0.0, -2.5, 3.1],
+      "scale": [12.0, 3.0, 0.2],
+      "physics": true,
+      "role": "structure"
+    },
+    {
+      "id": "floor_second_west",
+      "asset": "Cube",
+      "pos": [-5.5, 0.5, 3.1],
+      "scale": [1.0, 3.0, 0.2],
+      "physics": true,
+      "role": "structure"
+    },
+    {
+      "id": "floor_second_east",
+      "asset": "Cube",
+      "pos": [2.0, 0.5, 3.1],
+      "scale": [8.0, 3.0, 0.2],
       "physics": true,
       "role": "structure"
     },
@@ -48,8 +80,8 @@
     {
       "id": "l1_wall_south_right",
       "asset": "Cube",
-      "pos": [2.0, -4.0, 1.6],
-      "scale": [8.0, 0.2, 3.0],
+      "pos": [3.0, -4.0, 1.6],
+      "scale": [6.0, 0.2, 3.0],
       "physics": true,
       "role": "structure"
     },
@@ -180,9 +212,10 @@
 
   "requirements": [
     { "kind": "max_time_s", "value": 300 },
-    { "kind": "min_altitude_m", "value": 3.0 },
+    { "kind": "min_altitude_m", "value": 1.5 },
     { "kind": "no_collision", "value": true },
-    { "kind": "must_enter_building", "value": true }
+    { "kind": "must_enter_building", "value": true },
+    { "kind": "min_path_length_m", "value": 35.0 }
   ],
 
   "instruction": "Take off, fly east toward the two-storey building, enter through the ground-floor doorway, and locate the person on the second floor. Land within 4 metres of them."
