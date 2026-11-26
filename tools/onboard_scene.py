@@ -1,36 +1,48 @@
 #!/usr/bin/env python3
-"""Smoke test for a newly launched AirSim scene.
+"""Onboard a new simulator scene: verify it, profile it, and emit a first spec.
 
-Answers one question: can this scene serve as a base for the project? It runs the
-six checks below in order, reports PASS/FAIL for each, and writes a scene profile
-that later stages can reuse.
+This is the one command to run after starting any AirSim scene, whether it is
+OpenUAV, UAV-ON, or something else. It chains the two actions that always happen
+together when a scene is new:
 
-    1. the airsim Python package imports
-    2. a client can connect on the given port
-    3. listVehicles() returns something, and which names
+    phase 1  probe    six checks; write a profile describing what the scene has
+    phase 2  spec     optionally emit a minimal spec using only real assets
+
+Why the two phases are one tool: the spec can only be written after the asset
+list is known, and both run exactly once per scene. Keeping them apart meant
+copying a file path between two scripts for no benefit.
+
+The six checks
+--------------
+    1. the airsim package imports
+    2. a client connects on the given port
+    3. listVehicles() returns something
     4. simListAssets() returns something, and whether primitives exist
-    5. simSpawnObject() puts one object into the world and it can be read back
+    5. simSpawnObject() puts an object into the world and it can be read back
     6. simGetImages() returns an image from at least one camera
 
-Nothing here assumes the CityStreet asset set. It detects what the scene actually
-provides, so it works against an OpenUAV environment, UAV-ON, or anything else.
+Checks 5 and 6 are the decisive ones: without spawnable assets the pipeline can
+only rearrange what the map already contains; without images no evaluation is
+possible.
 
 Usage
 -----
-    # defaults: port 30100, auto-detect vehicle, auto-detect cameras
-    python scripts/smoke_test_scene.py
+    # probe only, write the profile
+    python tools/onboard_scene.py --port 30001 --scene openuav_moderncity
 
-    # name the scene so the generated profile is easy to find
-    python scripts/smoke_test_scene.py --scene modular_european --out runs/smoke
+    # probe, then also emit a minimal spec for a first render
+    python tools/onboard_scene.py --port 30001 --scene openuav_moderncity \\
+        --emit-spec specs/onboard_smoke.json
 
-    # force a probe asset instead of the auto-chosen primitive
-    python scripts/smoke_test_scene.py --asset SM_WoodenCrate_01
+    # force a specific probe asset
+    python tools/onboard_scene.py --port 30001 --asset Shape_Cube
 """
 from __future__ import annotations
 
 import argparse
 import json
 import logging
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -47,14 +59,13 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
-LOG = logging.getLogger("smoke_test")
+LOG = logging.getLogger("onboard")
 
 # Primitives that AirSim's UE plugin normally provides. Used only to prefer a
 # probe asset with predictable size over an arbitrary mesh.
 PRIMITIVE_CANDIDATES = ["Cube", "Sphere", "Plane", "Cylinder", "Cone"]
 
-# Camera names worth trying. OpenUAV and UAV-ON name their cameras differently,
-# so the test probes rather than assumes.
+# Camera names worth trying. Scenes differ, so probe rather than assume.
 CAMERA_CANDIDATES = [
     "FrontCamera", "DownCamera", "LeftCamera", "RightCamera", "RearCamera",
     "0", "1", "2", "3", "4",
@@ -80,7 +91,7 @@ class Checks:
     def render(self) -> None:
         print()
         print("=" * 72)
-        print("smoke test summary")
+        print("onboarding summary")
         print("=" * 72)
         for result in self.results:
             mark = "PASS" if result["passed"] else "FAIL"
@@ -93,7 +104,7 @@ class Checks:
 
 
 # --------------------------------------------------------------------------- #
-# Individual checks
+# Phase 1: probe
 # --------------------------------------------------------------------------- #
 def check_import(checks: Checks):
     try:
@@ -161,10 +172,10 @@ def check_assets(checks: Checks, client) -> List[str]:
 
     primitives = [a for a in PRIMITIVE_CANDIDATES if a in assets]
     detail = f"{len(assets)} assets"
-    if primitives:
-        detail += f"; primitives present: {primitives}"
-    else:
-        detail += f"; NO primitives found among {PRIMITIVE_CANDIDATES}"
+    detail += (
+        f"; primitives present: {primitives}" if primitives
+        else f"; NO primitives among {PRIMITIVE_CANDIDATES}"
+    )
     checks.record("4 simListAssets()", True, detail)
     return assets
 
@@ -172,8 +183,6 @@ def check_assets(checks: Checks, client) -> List[str]:
 def check_spawn(
     checks: Checks, airsim, client, vehicle: str, asset: str
 ) -> Optional[str]:
-    import math
-
     def count_objects() -> int:
         try:
             return len(list(client.simListSceneObjects()))
@@ -181,9 +190,9 @@ def check_spawn(
             return -1
 
     before = count_objects()
-    name = "smoke_probe_1"
+    name = "onboard_probe_1"
 
-    # 5 m ahead, 2 m above the origin, so it is in front of the default camera.
+    # 5 m ahead, 2 m above the origin, so it sits in front of the default camera.
     pose = airsim.Pose(
         airsim.Vector3r(5.0, 0.0, -2.0),
         airsim.to_quaternion(0.0, 0.0, 0.0),
@@ -246,7 +255,7 @@ def check_images(
 
         working.append(camera)
         if saved is None:
-            saved = out_dir / f"smoke_{camera}.png"
+            saved = out_dir / f"onboard_{camera}.png"
             airsim.write_file(str(saved), response.image_data_uint8)
 
     if not working:
@@ -261,18 +270,69 @@ def check_images(
 
 
 # --------------------------------------------------------------------------- #
+# Phase 2: emit a minimal spec from the profile
+# --------------------------------------------------------------------------- #
+def emit_minimal_spec(
+    assets: Sequence[str],
+    scene_id: str,
+    out_path: Path,
+    forced_asset: str = "",
+    scale: float = 3.0,
+) -> Optional[str]:
+    """Write a one-object spec that uses only assets the scene reported."""
+    if forced_asset:
+        asset = forced_asset
+    else:
+        asset = next((a for a in PRIMITIVE_CANDIDATES if a in assets), "")
+        if not asset:
+            asset = assets[0] if assets else ""
+
+    if not asset:
+        return None
+
+    spec = {
+        "version": "0.1",
+        "name": f"{scene_id}_onboard",
+        "seed": 1,
+        "origin": [0.0, 0.0, 0.0],
+        "objects": [
+            {
+                "id": "smoke_object",
+                "asset": asset,
+                "pos": [8.0, 0.0, 2.0],
+                "scale": [scale, scale, scale],
+                "physics": False,
+                "role": "prop",
+            }
+        ],
+        "target": {"object_id": "smoke_object", "landing_radius_m": 4.0},
+        "spawn": {"pos": [-14.0, 0.0, 8.0], "yaw_deg": 0.0},
+        "requirements": [],
+        "instruction": "Fly forward and inspect the test object.",
+    }
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+    return asset
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Verify that an AirSim scene can serve as a project base",
+        description="Verify and profile a new AirSim scene, then emit a first spec",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--port", type=int, default=30100, help="AirSim API port")
+    parser.add_argument("--port", type=int, default=30001, help="AirSim API port")
     parser.add_argument("--vehicle", default="", help="vehicle name; empty means auto")
     parser.add_argument("--asset", default="", help="probe asset; empty means auto")
-    parser.add_argument("--scene", default="", help="scene id, for the saved profile")
-    parser.add_argument("--out", type=Path, default=Path("runs/smoke"))
+    parser.add_argument("--scene", default="", help="scene id, used in file names")
+    parser.add_argument("--out", type=Path, default=Path("runs/onboard"))
+    parser.add_argument(
+        "--emit-spec", type=Path, default=None,
+        help="also write a minimal spec for a first render",
+    )
     parser.add_argument("--keep", action="store_true", help="leave the probe object")
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
@@ -284,11 +344,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
 
     args.out.mkdir(parents=True, exist_ok=True)
+    scene_id = args.scene or "unnamed"
     checks = Checks()
     report: Dict[str, Any] = {
         "tested_at": datetime.now().astimezone().isoformat(),
         "port": args.port,
-        "scene": args.scene or "unnamed",
+        "scene": scene_id,
     }
 
     # ---- 1. import ----
@@ -320,12 +381,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         checks.render()
         return 5
 
-    # ---- profile draft, written before spawning ----
-    # Written here on purpose: even if object spawning is unsupported, the
-    # vehicle, port and asset list are already valuable and worth keeping.
+    # The profile is written before spawning: even if spawning is unsupported,
+    # the vehicle, port and asset list are already worth keeping.
     def write_profile(camera_names: List[str]) -> Path:
         payload = {
-            "scene_id": args.scene or "unnamed",
+            "scene_id": scene_id,
             "port": args.port,
             "vehicle": vehicle,
             "cameras": camera_names,
@@ -333,14 +393,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "asset_count": len(assets),
             "assets": assets,
         }
-        target = args.out / f"profile_{args.scene or 'unnamed'}.json"
+        target = args.out / f"profile_{scene_id}.json"
         target.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
         return target
 
     profile_path = write_profile([])
-    LOG.info("scene profile written early: %s", profile_path)
+    LOG.info("profile written early: %s", profile_path)
 
     # ---- 5. spawn ----
     probe_asset = args.asset or ("Cube" if "Cube" in assets else assets[0])
@@ -349,12 +409,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if spawned is None:
         checks.render()
         print(f"\nprofile written anyway: {profile_path}")
-        print("spawning failed, so the scene cannot host generated objects yet.")
+        print("spawning failed, so this scene cannot host generated objects yet.")
         return 6
 
     # ---- 6. images ----
     cameras = check_images(checks, airsim, client, vehicle, args.out)
     report["working_cameras"] = cameras
+    if cameras:
+        profile_path = write_profile(cameras)
+        LOG.info("profile updated with %d camera(s)", len(cameras))
 
     # ---- cleanup ----
     if not args.keep and spawned:
@@ -364,24 +427,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as exc:  # noqa: BLE001
             LOG.warning("could not remove the probe object: %s", exc)
 
-    # ---- profile, now with the cameras that actually returned images ----
-    if cameras:
-        profile_path = write_profile(cameras)
-        LOG.info("scene profile updated with %d camera(s): %s", len(cameras), profile_path)
+    # ---- phase 2: optional spec ----
+    spec_path: Optional[Path] = None
+    used_asset: Optional[str] = None
+    if args.emit_spec:
+        used_asset = emit_minimal_spec(assets, scene_id, args.emit_spec, args.asset)
+        if used_asset:
+            spec_path = args.emit_spec
+            LOG.info("minimal spec written to %s (asset: %s)", spec_path, used_asset)
+        else:
+            LOG.error("could not emit a spec: the scene lists no assets")
 
     report["checks"] = checks.results
     report["profile_path"] = str(profile_path)
-    (args.out / "smoke_report.json").write_text(
+    if spec_path:
+        report["spec_path"] = str(spec_path)
+        report["spec_asset"] = used_asset
+
+    (args.out / "onboard_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
     checks.render()
     print()
-    print(f"scene profile written to {profile_path}")
-    print(f"full report written to {args.out / 'smoke_report.json'}")
-    print()
-    print("next step: send profile_*.json back so the asset catalogue can be")
-    print("rebuilt against this scene instead of the CityStreet one.")
+    print(f"profile : {profile_path}")
+    print(f"report  : {args.out / 'onboard_report.json'}")
+    if spec_path:
+        print(f"spec    : {spec_path}")
+        print()
+        print("next (first render on this scene):")
+        print(
+            f"  python scripts/main.py \\\n"
+            f"      --spec {spec_path} \\\n"
+            f"      --scene-profile {profile_path} \\\n"
+            f"      --no-verify \\\n"
+            f"      --out runs/render_1"
+        )
 
     return 0 if checks.all_passed else 1
 

@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Scene profiles: what a specific simulator scene actually provides.
 
-Why this exists
+Why this exists:
 ---------------
 Different packaged scenes expose different vehicle names, different camera
-names, and wildly different asset lists. Hard-coding any of them means the code
-works on exactly one scene.
+names, and wildly different asset lists.
 
-A profile is the small JSON that a smoke test produces once per scene:
+A profile is a JSON that a smoke test produces once per scene:
 
     {
       "scene_id": "openuav_moderncity",

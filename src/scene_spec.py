@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Scene specification: definition, validation, and coordinate conversion.
+"""Scene specification: 
+    -definition
+    -validation
+    -coordinate conversion
 
 Design rules
 ------------
@@ -81,7 +84,7 @@ class SpecError(ValueError):
 
 
 # --------------------------------------------------------------------------- #
-# Coordinate conversion: the only entry points
+# Coordinate conversion
 # --------------------------------------------------------------------------- #
 def enu_to_ned(enu: Sequence[float]) -> Tuple[float, float, float]:
     """ENU (east, north, up) -> NED (north, east, down), all in metres.
@@ -122,7 +125,7 @@ def yaw_enu_to_ned(yaw_deg: float) -> float:
 class SceneObject:
     id: str
     asset: str
-    pos: Tuple[float, float, float]          # ENU, relative to origin
+    pos: Tuple[float, float, float] # ENU, relative to origin
     yaw_deg: float = 0.0
     scale: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     physics: bool = False
@@ -137,7 +140,7 @@ class Target:
 
 @dataclass
 class Spawn:
-    pos: Tuple[float, float, float]           # ENU, relative to origin
+    pos: Tuple[float, float, float]  # ENU, relative to origin
     yaw_deg: float = 0.0
 
 
@@ -146,7 +149,7 @@ class SceneSpec:
     version: str
     name: str
     seed: int
-    origin: Tuple[float, float, float]        # world ENU
+    origin: Tuple[float, float, float] # world ENU
     objects: List[SceneObject]
     target: Optional[Target] = None
     spawn: Optional[Spawn] = None

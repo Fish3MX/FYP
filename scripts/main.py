@@ -1,5 +1,5 @@
-#!/usr/bin/env python3
-"""Closed-loop generator: a sentence becomes an inspected, rendered scene.
+﻿#!/usr/bin/env python3
+"""Main pipeline: a sentence becomes an inspected, rendered scenario.
 
 Four stages, each one independently switchable so a failure can be attributed:
 
@@ -15,29 +15,34 @@ it is only ever run as one opaque command, any failure looks the same. The flags
 let you climb a ladder: check the script offline, then the builder with a known
 good spec, then rendering, and only then the model.
 
+Scene coupling
+--------------
+Nothing here is bound to a particular map. The port, vehicle name and camera
+names come from a scene profile produced by `tools/onboard_scene.py`. Switching
+scenes means switching profiles, not editing code.
+
 What "empty scene" means here (and does not)
 --------------------------------------------
-The packaged simulator is a city street containing thousands of pre-existing
-objects. This tool adds a generated building on top of it. It cannot start from
-a blank world; that would need a separate UE project and a new package.
+A packaged simulator map already contains thousands of objects. This pipeline
+adds generated objects on top of it. It cannot start from a blank world; that
+would need a separate UE project and a new package.
 
 Camera convention
 -----------------
-The four cameras are bolted to the airframe and defined in settings.json:
-0=front, 1=left, 2=right, 3=down. Orientation is therefore controlled by yawing
-the vehicle, not by pitching it: the dedicated downward camera already gives the
-overhead view. Keeping pitch at zero avoids attitude gymnastics and the physics
-that comes with them.
+Cameras are bolted to the airframe and defined in the scene's settings.json, so
+orientation is controlled by yawing the vehicle rather than pitching it. The
+dedicated downward camera provides the overhead view, which keeps attitude at
+zero and avoids unnecessary physics.
 
 Usage
 -----
     # Ladder, cheapest first
-    python scripts/generate_and_render.py --request "fire in a two-storey flat" \\
-        --offline --no-build
-    python scripts/generate_and_render.py --spec specs/fire_floor2.json --no-render
-    python scripts/generate_and_render.py --spec specs/fire_floor2.json
-    python scripts/generate_and_render.py --request "a drone searching for a
-        survivor in a burning two-storey apartment"
+    python scripts/main.py --request "fire in a two-storey flat" --offline --no-build
+    python scripts/main.py --spec specs/onboard_smoke.json --no-render
+    python scripts/main.py --spec specs/onboard_smoke.json \\
+        --scene-profile runs/onboard/profile_<scene>.json --no-verify
+    python scripts/main.py --request "a drone searching for a survivor" \\
+        --scene-profile runs/onboard/profile_<scene>.json
 """
 from __future__ import annotations
 
@@ -75,7 +80,7 @@ from scene_spec import (  # noqa: E402
     yaw_enu_to_ned,
 )
 
-LOG = logging.getLogger("generate_and_render")
+LOG = logging.getLogger("main")
 
 # Bumping this string makes it obvious in the logs which version ran.
 VERSION = "0.3"
@@ -343,7 +348,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--vehicle", default="Drone_1")
     parser.add_argument(
         "--scene-profile", default="",
-        help="profile_*.json from scripts/smoke_test_scene.py; sets port, "
+        help="profile_*.json from tools/onboard_scene.py; sets port, "
              "vehicle and camera names for this scene",
     )
     parser.add_argument("--prefix", default="gen")
@@ -358,7 +363,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
-    LOG.info("generate_and_render v%s", VERSION)
+    LOG.info("main v%s", VERSION)
 
     if not args.request and not args.spec:
         parser.error("one of --request or --spec is required")
