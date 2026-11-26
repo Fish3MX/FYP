@@ -78,8 +78,10 @@ from scene_spec import (  # noqa: E402
 LOG = logging.getLogger("generate_and_render")
 
 # Bumping this string makes it obvious in the logs which version ran.
-VERSION = "0.2"
+VERSION = "0.3"
 
+# Fallback camera mapping for the CityStreet scene, used when no scene profile
+# is supplied. A profile always wins, because camera names are scene-specific.
 CAMERAS: Dict[str, str] = {"0": "front", "1": "left", "2": "right", "3": "down"}
 
 
@@ -251,8 +253,10 @@ def stage_build(spec: SceneSpec, args) -> bool:
 # --------------------------------------------------------------------------- #
 # Stage 4: render
 # --------------------------------------------------------------------------- #
-def stage_render(spec: SceneSpec, args, out_dir: Path) -> List[Dict[str, Any]]:
-    """Place the vehicle at each vantage point and capture all four cameras."""
+def stage_render(
+    spec: SceneSpec, args, out_dir: Path, cameras: Dict[str, str]
+) -> List[Dict[str, Any]]:
+    """Place the vehicle at each vantage point and capture every camera."""
     import airsim
     import scene_builder
 
@@ -285,7 +289,7 @@ def stage_render(spec: SceneSpec, args, out_dir: Path) -> List[Dict[str, Any]]:
                 pixels_as_float=False,
                 compress=True,
             )
-            for camera in CAMERAS
+            for camera in cameras
         ]
         responses = client.simGetImages(requests, vehicle_name=args.vehicle)
 
@@ -297,7 +301,7 @@ def stage_render(spec: SceneSpec, args, out_dir: Path) -> List[Dict[str, Any]]:
             "images": [],
         }
 
-        for (camera, view), response in zip(CAMERAS.items(), responses):
+        for (camera, view), response in zip(cameras.items(), responses):
             if response is None or len(response.image_data_uint8) == 0:
                 LOG.warning("[%s] camera %s returned no image", label, camera)
                 continue
@@ -337,6 +341,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     parser.add_argument("--port", type=int, default=30100)
     parser.add_argument("--vehicle", default="Drone_1")
+    parser.add_argument(
+        "--scene-profile", default="",
+        help="profile_*.json from scripts/smoke_test_scene.py; sets port, "
+             "vehicle and camera names for this scene",
+    )
     parser.add_argument("--prefix", default="gen")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--temperature", type=float, default=0.2)
@@ -353,6 +362,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not args.request and not args.spec:
         parser.error("one of --request or --spec is required")
+
+    # A scene profile carries the camera names, port and vehicle that this
+    # particular scene actually uses. Without one we fall back to the
+    # CityStreet defaults, which will produce empty images elsewhere.
+    cameras: Dict[str, str] = dict(CAMERAS)
+    if args.scene_profile:
+        import scene_profile
+
+        profile = scene_profile.load(args.scene_profile)
+        LOG.info("scene profile loaded:\n%s", profile.describe())
+        args.port = profile.port
+        args.vehicle = profile.vehicle
+        cameras = profile.pick_capture_cameras()
+        LOG.info("capture cameras: %s", list(cameras))
+    else:
+        LOG.warning(
+            "no --scene-profile given; using CityStreet camera names %s. "
+            "On another scene this yields empty images.",
+            list(cameras),
+        )
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = args.out or (Path("runs") / f"render_{stamp}")
@@ -390,7 +419,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # ---- stage 4 ----
     LOG.info("[stage 4] rendering")
     try:
-        rendered = stage_render(spec, args, out_dir)
+        rendered = stage_render(spec, args, out_dir, cameras)
     except Exception as exc:  # noqa: BLE001
         LOG.error("[stage 4] rendering failed: %s", exc)
         if LOG.isEnabledFor(logging.DEBUG):

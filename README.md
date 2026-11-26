@@ -1,3 +1,143 @@
+# OpenUAV 主线说明
+
+本项目当前主线是：自然语言任务 -> LLM 或模板生成 JSON 规格 -> 通过 AirSim RPC 连接 OpenUAV -> 动态放置目标和障碍物 -> UAV 执行、图像/轨迹记录 -> 指标评估。
+
+OpenUAV / TravelUAV 提供 Unreal/AirSim 世界、无人机、相机和控制接口；本项目负责任务规格、校验、动态物体放置和实验编排。
+
+> 首次接入 OpenUAV 时不要直接运行 `specs/fire_floor2.json`。该文件是旧 CityStreet/UAVon 环境的参考规格，里面的资产不能假设在 OpenUAV 中存在。
+
+## 快速开始
+
+### 安装
+
+```bash
+cd /home/SIGPhysics/data/Project
+python -m pip install -r requirements.txt
+python -c "import airsim; print('AirSim import: OK')"
+```
+
+### 启动 OpenUAV
+
+```bash
+cd /home/SIGPhysics/data/OpenUAV/airsim_plugin
+grep -n "env_exec_path_dict" -A40 AirVLNSimulatorServerTool.py
+find /home/SIGPhysics/data/OpenUAV -maxdepth 4 -type f -name "*.sh" -o -name "*.exe"
+```
+
+确认 `env_exec_path_dict` 指向实际存在的 Unreal 启动文件后运行：
+
+```bash
+python AirVLNSimulatorServerTool.py --port 30100 --root_path /home/SIGPhysics/data/OpenUAV
+```
+
+另开终端确认：
+
+```bash
+ss -lntp | grep 30100
+```
+
+### 获取 vehicle 和资产
+
+```bash
+python - <<'PY'
+import airsim
+c = airsim.MultirotorClient(port=30100)
+c.confirmConnection()
+print("vehicles:", c.listVehicles())
+assets = c.simListAssets()
+print("asset count:", len(assets))
+print("first assets:", assets[:20])
+PY
+```
+
+后续规格只能使用 `simListAssets()` 中确认存在的资产，`--vehicle` 也必须使用 `listVehicles()` 返回的名称。
+
+### 最小 smoke test
+
+创建 `specs/open_uav_smoke_test.json`。如果 OpenUAV 没有 `Cube`，替换为实际存在的简单资产：
+
+```json
+{
+  "version": "0.1",
+  "name": "open_uav_smoke_test",
+  "seed": 1,
+  "origin": [0, 0, 0],
+  "objects": [{"id": "test_object", "asset": "Cube", "pos": [5, 0, 1], "scale": [2, 2, 2], "physics": true, "role": "prop"}],
+  "spawn": {"pos": [0, 0, 5], "yaw_deg": 0},
+  "requirements": [],
+  "instruction": "Inspect the test object."
+}
+```
+
+运行：
+
+```bash
+cd /home/SIGPhysics/data/Project
+python scripts/generate_and_render.py --spec specs/open_uav_smoke_test.json --port 30100 --vehicle Drone_1 --no-verify
+```
+
+如果 vehicle 不是 `Drone_1`，替换参数。成功标准是连接成功、资产存在、`simSpawnObject()` 成功、`simGetImages()` 返回图像，并在 `runs/` 下生成图片和 `render_report.json`。第一次测试保留 `--no-verify`，因为 OpenUAV 原有地图不一定满足旧验证器的几何假设。
+
+### LLM 编译
+
+只有 `--request` 会调用 LLM；`--spec` 读取已有 JSON；`--offline` 使用确定性模板。
+
+```bash
+cp .env.example .env
+# 设置 LLM_API_KEY、LLM_BASE_URL、LLM_MODEL
+python scripts/check_llm.py
+python scripts/generate_and_render.py --request "Test a drone searching an OpenUAV city block for a parked car" --port 30100 --vehicle Drone_1 --no-verify
+```
+
+LLM 只生成任务/场景计划，不创建 Unreal 建筑或材质。动态资产必须已存在于 OpenUAV，或可通过 AirSim API 生成。
+
+## 后续开发顺序
+
+1. 加入一个已确认存在的目标资产；
+2. 加入障碍物并检查实际 pose；
+3. 执行搜索或导航 episode；
+4. 记录 pose、action、timestamp、碰撞和目标距离；
+5. 计算成功率、路径长度、时间和碰撞次数；
+6. 确认 OpenUAV 坐标系和地图范围后，再启用或改造几何验证。
+
+规格使用 ENU（x east、y north、z up），AirSim 使用 NED（x north、y east、z down），转换集中在 `src/scene_spec.py`。
+
+## 不依赖仿真的检查
+
+```bash
+python tests/test_offline.py
+python src/scene_spec.py specs/open_uav_smoke_test.json
+```
+
+---
+
+## 备选删除栏：旧 UAVon / CityStreet 流程
+
+> 本节保留旧内容作为备选参考。当前 OpenUAV 主线不使用这套流程；确认不再维护 UAVon 后可整体删除。
+
+旧 CityStreet 启动示例：
+
+```bash
+bash CleanCityStreet.sh -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter=0 --settings=/path/to/settings/30100/settings.json
+```
+
+旧场景测试：
+
+```bash
+python scripts/hello_uav.py --connect-only -v
+python scripts/probe_assets.py --spawn --json assets_report.json
+python scripts/generate_and_render.py --spec specs/fire_floor2.json --port 30100 --vehicle Drone_1
+```
+
+`specs/fire_floor2.json` 假设存在 CityStreet/UAVon 的 `Cube`、建筑门窗、楼梯和人物资产。切换环境前必须重新调用 `simListAssets()`。
+
+## References
+
+- OpenUAV / TravelUAV: https://prince687028.github.io/OpenUAV/
+- OpenUAV repository: https://github.com/prince687028/TravelUAV
+- AirSim: https://microsoft.github.io/AirSim/
+
+See `LICENSE` for the licence.
 # FYP — Task-Driven, Verifiable 3D Scene Generation for UAV Simulation Benchmarking
 
 Automatic generation of flyable UAV test scenarios from natural-language test
@@ -377,3 +517,364 @@ requests, with and without the gate, are the numbers to report.
 ## Licence
 
 See `LICENSE`.
+
+## CN
+这个项目的核心目标是：把自然语言测试需求自动编译成一个可在 AirSim 中运行的无人机搜索场景，并在真正生成场景前验证它是否可行、是否具有足够的搜索难度。
+
+整体 pipeline 可以概括为：
+
+┌──────────────────────────────────────────┐
+│ 自然语言需求                             │
+│                                          ├─────────┐
+└──────────────────────────────────────────┘         │
+                                                     │
+                                                     │
+┌──────────────────────────────────────────┐         │
+│ LLM Compiler                             │         │
+│                                          ├◄────────┘
+│                                          ├───────────┐
+│                                          ├◄──────────╪─────┐
+└──────────────────────────────────────────┘           │     │
+                                                       │     │
+                                                       │     │
+┌──────────────────────────────────────────┐           │     │
+│ JSON 场景规格 SceneSpec                  │           │     │
+│                                          ├◄──────────┘     │
+│                                          ├─────────────┐   │
+└──────────────────────────────────────────┘             │   │
+                                                         │   │
+                                                         │   │
+┌──────────────────────────────────────────┐             │   │
+│ 结构与语义校验                           │             │   │
+│                                          ├◄────────────┘   │
+│                                          ├───────────────┐ │
+└──────────────────────────────────────────┘               │ │
+                                                           │ │
+                                                           │ │
+┌──────────────────────────────────────────┐               │ │
+│ 几何验证                                 │               │ │
+│                                          ├◄──────────────┘ │
+│                                          ├──失败───────────┘
+│                                          ├──通过─────────────┐
+└──────────────────────────────────────────┘                   │
+                                                               │
+                                                               │
+┌──────────────────────────────────────────┐                   │
+│ AirSim 场景构建                          │                   │
+│                                          ├◄──────────────────┘
+│                                          ├─────────────────────┐
+└──────────────────────────────────────────┘                     │
+                                                                 │
+                                                                 │
+┌──────────────────────────────────────────┐                     │
+│ 生成多个视角图像                         │                     │
+│                                          ├◄────────────────────┘
+│                                          ├───────────────────────┐
+└──────────────────────────────────────────┘                       │
+                                                                   │
+                                                                   │
+┌──────────────────────────────────────────┐                       │
+│ 保存 spec / verification / render report │                       │
+│                                          ├◄──────────────────────┘
+└──────────────────────────────────────────┘
+
+## 1. 输入：自然语言需求或已有 JSON
+
+入口主要是 scripts/generate_and_render.py (scripts/generate_and_render.py)。
+
+它支持三种输入方式：
+
+- --request "..."：输入自然语言，由 LLM 生成场景；
+- --offline：不调用 LLM，使用确定性的模板生成；
+- --spec path.json：直接读取已有场景规格。
+
+例如：
+
+Test a drone searching for a survivor inside a burning two-storey apartment.
+
+该需求最终要变成一个结构化 JSON，主要包括：
+
+- 场景名称和随机种子；
+- 世界原点；
+- 场景物体；
+- 每个物体的位置、旋转、缩放和物理属性；
+- 目标物体；
+- 无人机初始位置；
+- 时间、高度等任务约束；
+- 给无人机的任务说明。
+
+这些数据结构定义在 src/scene_spec.py (src/scene_spec.py)。
+
+## 2. 坐标系统统一为 ENU
+
+项目在规格文件中使用 ENU 坐标：
+
+- x：向东；
+- y：向北；
+- z：向上；
+- yaw：从东开始逆时针计算。
+
+AirSim 使用 NED 坐标：
+
+- x：向北；
+- y：向东；
+- z：向下。
+
+因此所有转换集中在 scene_spec.py：
+
+enu_to_ned()
+ned_to_enu()
+yaw_enu_to_ned()
+
+这一点很关键，因为场景生成、几何验证和 AirSim 实际摆放必须使用同一套空间语义。物体的本地位置会先加上 origin，转换成世界 ENU，再交给 AirSim。
+
+## 3. LLM 编译自然语言需求
+
+核心逻辑在 src/llm_compiler.py (src/llm_compiler.py) 的 compile_request()。
+
+LLM 并不直接生成 Unreal/AirSim 代码，而是生成受约束的 JSON 配置。编译过程有多个 gate：
+
+### 第一层：Prompt 约束
+
+system_prompt() 和 user_prompt() 会告诉模型：
+
+- JSON schema；
+- ENU 坐标约定；
+- 可用资产名称；
+- 角色类型；
+- 目标、出生点和任务要求；
+- 物体数量等限制。
+
+可用资产由 src/asset_catalog.py (src/asset_catalog.py) 提供。
+
+### 第二层：JSON 解析
+
+extract_json() 从模型输出中提取 JSON。
+
+如果模型输出了自然语言、错误 JSON 或 Markdown 代码块，当前尝试会失败，然后把错误反馈给模型。
+
+### 第三层：结构校验
+
+parse_spec() 会检查：
+
+- version 是否正确；
+- 场景名称是否存在；
+- 物体列表是否为空；
+- 物体 ID 是否重复；
+- 坐标、缩放是否为三个数字；
+- scale 是否大于 0；
+- role 是否属于规定集合；
+- target 是否引用了真实物体；
+- requirements 是否为合法数组。
+
+错误会被收集起来一次性反馈，而不是遇到第一个错误就停止。
+
+### 第四层：语义和资产校验
+
+validate_all() 继续检查：
+
+- 资产是否在白名单中；
+- 物体数量是否合理；
+- spawn 高度是否合理；
+- target 是否和 spawn 太近；
+- physics 物体是否满足场景要求；
+- 任务是否满足基本可执行条件。
+
+如果失败，模型收到具体错误列表并重新生成完整 JSON。
+
+### 第五层：几何验证
+
+如果开启 verify_geometry=True，会调用 src/verifier.py (src/verifier.py) 的 verify()。
+
+如果场景不能形成有效搜索任务，也会反馈给模型重写。最多重试 max_attempts 次，默认是 3 次。
+
+## 4. 几何验证：判断场景是否真的可用
+
+这是项目区别于普通“LLM 生成 3D 场景”的核心部分。
+
+verifier.verify() 主要执行以下步骤。
+
+### 4.1 初始视线遮挡检查
+
+项目把 structure 和 prop 物体转换成 AABB 包围盒，然后检查：
+
+spawn → target
+
+之间的直线是否穿过障碍物。
+
+如果目标从出生点一眼就能看到，场景会被判定为过于简单。
+
+### 4.2 建立三维占据栅格
+
+build_grid() 将场景离散成 3D occupancy grid：
+
+- 障碍物所在单元格标记为 blocked；
+- 加入无人机安全 clearance；
+- 目标附近允许寻找可降落单元格。
+
+### 4.3 A* 路径搜索
+
+astar() 在三维栅格上寻找 spawn 到 target 的可行路径。
+
+它验证两件事：
+
+- 是否存在路径；
+- 路径是否需要绕行。
+
+项目会计算：
+
+detour_ratio = 实际路径长度 / 直线距离
+
+如果路径太短，或者 detour ratio 太小，场景会被判定为“几乎直达”，不符合搜索任务要求。
+
+### 4.4 任务约束验证
+
+check_requirements() 检查规格中的任务要求，例如：
+
+- 最大时间；
+- 最低飞行高度；
+- 最大路径长度；
+- 其他可计算约束。
+
+最终返回 VerificationResult，包括：
+
+- 是否可达；
+- 是否初始遮挡；
+- 路径长度；
+- 直线距离；
+- detour ratio；
+- 最低路径高度；
+- 失败原因列表。
+
+只有 result.usable == True 才能进入 AirSim。
+
+## 5. AirSim 场景构建
+
+场景通过 src/scene_builder.py (src/scene_builder.py) 写入 AirSim。
+
+stage_build() 的步骤是：
+
+1. 连接 AirSim；
+2. 调用 simListAssets() 获取当前环境支持的资产；
+3. 检查规格中使用的 asset 是否存在；
+4. 删除旧场景中带有指定 prefix 的对象；
+5. 对每个 SceneObject 调用 simSpawnObject()；
+6. 设置：
+   - AirSim pose；
+   - scale；
+   - physics；
+   - 对象名称；
+7. 读取对象实际 pose，检查是否发生明显位置漂移。
+
+物体的位置处理过程是：
+
+局部 ENU 坐标
+    ↓ 加 origin
+世界 ENU 坐标
+    ↓ ENU → NED
+AirSim Pose
+    ↓
+simSpawnObject()
+
+无人机初始位置也通过 move_drone_to_spawn() 转换后设置到 AirSim。
+
+## 6. 渲染和图像采集
+
+场景构建完成后，stage_render() 会生成三个固定视角：
+
+- 01_spawn_view：从声明的出生点观察；
+- 02_approach：从斜前方观察；
+- 03_overhead：从上方观察。
+
+每个视角会：
+
+1. 计算相机位置；
+2. 计算相机朝向；
+3. 将无人机瞬移到该位置；
+4. 调用 simGetImages()；
+5. 获取多个摄像头画面；
+6. 将图像写入：
+
+runs/<run>/images/
+
+同时生成：
+
+- spec.json：最终场景规格；
+- verification.json：几何验证结果；
+- render_report.json：图像和视角信息。
+
+## 7. 批量实验 pipeline
+
+另一个重要入口是 scripts/batch_compile.py (scripts/batch_compile.py)。
+
+它用于研究和统计，不负责 AirSim 渲染。
+
+批量流程是：
+
+多个自然语言请求
+    ↓
+重复调用 compile_request()
+    ↓
+记录每个请求用了几次 LLM 尝试
+    ↓
+记录接受率、失败类型、路径长度、detour ratio
+    ↓
+输出 CSV / JSON / failures.log
+
+它支持：
+
+- LLM 条件；
+- deterministic template 条件；
+- 关闭几何验证的 ablation；
+- 每个请求多次 trial；
+- 失败原因分类。
+
+输出通常包括：
+
+results.csv
+summary.json
+failures.log
+specs/*.json
+
+失败类型包括：
+
+- JSON 解析失败；
+- 结构验证失败；
+- 资产幻觉；
+- 无可行路径；
+- 没有遮挡；
+- 场景太简单；
+- 任务约束无法满足。
+
+## 8. 一次完整运行的实际顺序
+
+以 generate_and_render.py 为例，完整执行顺序是：
+
+1. 读取自然语言 request
+2. 读取 .env 中的 LLM 配置
+3. 调用 LLM
+4. 提取 JSON
+5. parse_spec()
+6. 检查资产和语义规则
+7. verifier.verify()
+8. 失败则把具体问题反馈给 LLM 重试
+9. 保存 spec.json
+10. 连接 AirSim
+11. 检查 simListAssets()
+12. 清理旧对象
+13. 生成新对象
+14. 检查生成结果
+15. 将无人机放到多个观察点
+16. 采集图像
+17. 保存 verification 和 render report
+
+所以这个项目真正实现的是一条闭环：
+
+自然语言任务
+→ 结构化场景计划
+→ 结构/语义检查
+→ 物理几何可行性检查
+→ AirSim 场景实例化
+→ 图像采集与实验记录
+
+核心设计思想是：LLM 只负责提出场景计划，规则验证器负责把计划约束成可执行、可重复、具有搜索难度的测试场景。
