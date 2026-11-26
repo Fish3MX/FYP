@@ -68,15 +68,29 @@ class SceneProfile:
         return not self.assets or name in self.assets
 
     def pick_capture_cameras(self, exclude_record: bool = True) -> Dict[str, str]:
-        """Camera name -> role, without the duplicate recording cameras."""
-        if not exclude_record:
-            return dict(self.cameras)
-        kept = {
-            name: role
-            for name, role in self.cameras.items()
-            if not name.lower().endswith(_RECORD_SUFFIXES)
-        }
-        return kept or dict(self.cameras)
+        """Camera name -> role, without duplicates or recording copies.
+
+        A scene may expose both descriptive names (FrontCamera, DownCamera) and
+        bare indices (0, 1, 2). Both can return images -- AirSim falls back to
+        camera indices -- but capturing both doubles the work for no benefit.
+        Descriptive names win, because they also carry the direction.
+        """
+        candidates = dict(self.cameras)
+
+        if exclude_record:
+            kept = {
+                name: role
+                for name, role in candidates.items()
+                if not name.lower().endswith(_RECORD_SUFFIXES)
+            }
+            if kept:
+                candidates = kept
+
+        named = {n: r for n, r in candidates.items() if not n.strip().isdigit()}
+        if named:
+            return named
+
+        return candidates
 
     def describe(self) -> str:
         lines = [
