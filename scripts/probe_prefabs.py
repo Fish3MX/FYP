@@ -45,10 +45,12 @@ def enu_to_ned(enu: Sequence[float]) -> "airsim.Vector3r":
     return airsim.Vector3r(float(enu[1]), float(enu[0]), -float(enu[2]))
 
 
-def set_view(client, vehicle: str, distance: float, height: float) -> None:
-    """Place the drone at the measuring vantage point, facing north."""
+def set_view(
+    client, vehicle: str, distance: float, height: float, origin: Sequence[float] = (0.0, 0.0, 0.0)
+) -> None:
+    """Place the drone south of `origin` at the given height, facing north."""
     pose = airsim.Pose(
-        enu_to_ned([0.0, -distance, height]),
+        enu_to_ned([origin[0], origin[1] - distance, height]),
         airsim.to_quaternion(0.0, 0.0, 0.0),   # yaw 0 in NED = north
     )
     client.simSetVehiclePose(pose, ignore_collision=True, vehicle_name=vehicle)
@@ -127,6 +129,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--height", type=float, default=CAMERA_Z,
                         help="camera height, metres")
     parser.add_argument("--fov", type=float, default=FOV_DEG, help="camera horizontal FOV")
+    parser.add_argument("--spacing", type=float, default=0.0,
+                        help="distance between probe objects along east; 0 keeps them "
+                             "all at the same spot, which is safer because off-origin "
+                             "ground may already be occupied")
     parser.add_argument("--keep", action="store_true", help="leave the last probe in place")
     args = parser.parse_args(argv)
 
@@ -137,20 +143,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     client = airsim.MultirotorClient(port=args.port)
     client.confirmConnection()
     print(f"connected; vehicles={client.listVehicles()}")
-    print(f"vantage: {args.distance:.0f} m south of origin, {args.height:.0f} m up, facing north\n")
-
-    set_view(client, args.vehicle, args.distance, args.height)
-    background = grab_depth(client, args.vehicle, args.camera)
+    print(f"vantage: {args.distance:.0f} m south of each object, {args.height:.0f} m up, "
+          f"objects {args.spacing:.0f} m apart\n")
 
     print(f"  {'asset':<26} {'spawn':<7} {'drift':<7} {'px':>9} {'depth':>8} "
-          f"{'width':>7} {'height':>7}")
-    print("  " + "-" * 82)
+          f"{'width':>7} {'height':>7} {'residual':>9}")
+    print("  " + "-" * 94)
 
     results: List[Dict[str, object]] = []
 
     for index, asset in enumerate(args.assets):
         name = f"probe_building_{index}"
-        pose = airsim.Pose(enu_to_ned([0.0, 0.0, 0.0]), airsim.to_quaternion(0, 0, 0))
+
+        # Each object gets its own patch of ground, so a failed destroy cannot
+        # make two probes overlap and corrupt the measurement.
+        origin = [index * args.spacing, 0.0, 0.0]
+        set_view(client, args.vehicle, args.distance, args.height, origin)
+        background = grab_depth(client, args.vehicle, args.camera)
+
+        pose = airsim.Pose(enu_to_ned(origin), airsim.to_quaternion(0, 0, 0))
 
         try:
             ok = client.simSpawnObject(
@@ -171,35 +182,54 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             actual = client.simGetObjectPose(name)
             drift = math.dist(
                 [actual.position.x_val, actual.position.y_val, actual.position.z_val],
-                [0.0, 0.0, 0.0],
+                [origin[1], origin[0], -origin[2]],   # expected pose is NED
             )
         except Exception:  # noqa: BLE001
             drift = float("nan")
 
-        grab_rgb(client, args.vehicle, args.camera, args.out / f"{asset}.png")
+        # Pair of pictures per asset: one with the object present, one after it
+        # is removed. Comparing them shows what the object actually contributed.
+        grab_rgb(client, args.vehicle, args.camera, args.out / f"{asset}_placed.png")
         current = grab_depth(client, args.vehicle, args.camera)
         stats = measure(background, current, args.fov)
 
+        # Verify the destroy actually removed it; otherwise the next probe may
+        # be contaminated and every size will look the same.
+        destroyed = False
+        try:
+            client.simDestroyObject(name)
+            destroyed = True
+        except Exception as exc:  # noqa: BLE001
+            print(f"    destroy failed: {exc}")
+        after = grab_depth(client, args.vehicle, args.camera)
+        grab_rgb(client, args.vehicle, args.camera, args.out / f"{asset}_removed.png")
+        residual = measure(background, after, args.fov)
+
         if stats is None:
-            print(f"  {asset:<26} True    {drift:<7.2f} {'-- no pixels changed (invisible or tiny)'}")
-            results.append({"asset": asset, "spawned": True, "drift": drift, "measured": None})
+            print(f"  {asset:<26} True    {drift:<7.2f} {'-- no pixels changed':<40} "
+                  f"{'n/a' if residual is None else residual['pixels']:>9}")
+            results.append({"asset": asset, "spawned": True, "drift": drift,
+                            "measured": None, "destroyed": destroyed,
+                            "residual_pixels": None if residual is None else residual["pixels"]})
         else:
             print(
                 f"  {asset:<26} True    {drift:<7.2f} "
                 f"{stats['pixels']:>9} {stats['depth_m']:>8} "
-                f"{stats['width_m']:>7} {stats['height_m']:>7}"
+                f"{stats['width_m']:>7} {stats['height_m']:>7} "
+                f"{'0' if residual is None else residual['pixels']:>9}"
             )
-            results.append({"asset": asset, "spawned": True, "drift": drift, "measured": stats})
-
-        client.simDestroyObject(name)
+            results.append({"asset": asset, "spawned": True, "drift": drift,
+                            "measured": stats, "destroyed": destroyed,
+                            "residual_pixels": None if residual is None else residual["pixels"]})
 
     if args.keep and args.assets:
         # Re-spawn the last one so it can be inspected by hand.
         name = "probe_building_kept"
+        origin = [(len(args.assets) - 1) * args.spacing, 0.0, 0.0]
         client.simSpawnObject(name, args.assets[-1], airsim.Pose(
-            enu_to_ned([0.0, 0.0, 0.0]), airsim.to_quaternion(0, 0, 0)),
+            enu_to_ned(origin), airsim.to_quaternion(0, 0, 0)),
             airsim.Vector3r(1, 1, 1), physics_enabled=True)
-        print(f"\nkept '{name}' ({args.assets[-1]}) in the scene")
+        print(f"\nkept '{name}' ({args.assets[-1]}) at ENU {origin}")
 
     print()
     usable = [r for r in results if r.get("spawned")]
